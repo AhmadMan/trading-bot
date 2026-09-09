@@ -183,12 +183,18 @@ if anySignal
     else if qty > 0
         nFilled += 1
 
+// Each add needs its own order ID. Reusing one ID modifies the existing entry
+// instead of stacking a new one, so with allowAdds on the later signals would
+// silently fail to build a position.
+var int entrySeq = 0
 if canTrade and qty > 0 and (allowAdds or strategy.position_size == 0)
     if longSignal
-        strategy.entry('L', strategy.long, qty=qty)
+        entrySeq += 1
+        strategy.entry('L' + str.tostring(entrySeq), strategy.long, qty=qty)
         tradesToday += 1
     else if shortSignal
-        strategy.entry('S', strategy.short, qty=qty)
+        entrySeq += 1
+        strategy.entry('S' + str.tostring(entrySeq), strategy.short, qty=qty)
         tradesToday += 1
 
 // Protective bracket. The window close is the real exit; these only cap a bar
@@ -198,7 +204,9 @@ if strategy.position_size != 0
     isLong  = strategy.position_size > 0
     sl = isLong ? entryPx - stopDist : entryPx + stopDist
     tp = useTarget ? (isLong ? entryPx + stopDist * targetR : entryPx - stopDist * targetR) : na
-    strategy.exit('X', from_entry=isLong ? 'L' : 'S', stop=sl, limit=tp)
+    // No from_entry: with unique per-add IDs the stop has to cover every open
+    // entry, not just one of them.
+    strategy.exit('X', stop=sl, limit=tp)
 
 // Flat at the window boundary — the whole premise is that the edge, if any,
 // lives inside the final minutes and does not survive being held longer.
