@@ -36,9 +36,9 @@ strategy('XAU Momentum Into Close', shorttitle='XAU_MIC', overlay=true,
 winMin       = input.int(5,    'Window length (minutes)',    minval=2, maxval=240, group='Window')
 entryLeadMin = input.int(2,    'Enter with N minutes left',  minval=1, maxval=60,  group='Window')
 
-moveMode     = input.string('USD', 'Move threshold mode', options=['USD', 'ATR'], group='Entry')
+moveMode     = input.string('ATR', 'Move threshold mode', options=['USD', 'ATR'], group='Entry')
 moveThresh   = input.float(2.5,  'Min move from window open ($)', minval=0.0, step=0.1, group='Entry')
-moveAtrMult  = input.float(0.8,  'Min move (ATR multiples)',      minval=0.0, step=0.1, group='Entry')
+moveAtrMult  = input.float(1.5,  'Min move (ATR multiples)',      minval=0.0, step=0.1, group='Entry')
 atrLen       = input.int(14,     'ATR length',                    minval=1,            group='Entry')
 requireAlign = input.bool(true,  'Signal bar must close with the move', group='Entry')
 minBodyPct   = input.float(40.0, 'Min signal-bar body (% of range)', minval=0, maxval=100, step=5, group='Entry')
@@ -54,8 +54,8 @@ targetR      = input.float(1.0,  'Target (R multiples)',       minval=0.1, step=
 riskPct      = input.float(0.5,  'Risk per trade (% equity)',  minval=0.01, maxval=5.0, step=0.05, group='Risk')
 maxTrades    = input.int(20,     'Max trades per day',         minval=1,            group='Risk')
 dailyLossPct = input.float(3.0,  'Daily loss stop (% equity)', minval=0.1, step=0.5, group='Risk')
-minAtr       = input.float(0.5,  'Min ATR to trade ($)',       minval=0.0, step=0.1, group='Risk')
-maxAtr       = input.float(15.0, 'Max ATR to trade ($)',       minval=0.1, step=0.5, group='Risk')
+minAtr       = input.float(0.0,  'Min ATR to trade ($), 0=off', minval=0.0, step=0.1, group='Risk')
+maxAtr       = input.float(0.0,  'Max ATR to trade ($), 0=off', minval=0.0, step=0.5, group='Risk')
 
 useSession   = input.bool(false, 'Restrict to a session',      group='Session')
 sessStr      = input.session('0800-1700', 'Session',           group='Session')
@@ -111,7 +111,7 @@ alignedDown = not requireAlign or barDown
 bodyOk      = bodyPct >= minBodyPct
 
 inSession = not useSession or not na(time(timeframe.period, sessStr, sessTz))
-liquidityOk = not na(atr) and atr >= minAtr and atr <= maxAtr
+liquidityOk = not na(atr) and (minAtr <= 0 or atr >= minAtr) and (maxAtr <= 0 or atr <= maxAtr)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Daily risk governor

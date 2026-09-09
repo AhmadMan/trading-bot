@@ -25,9 +25,9 @@ input int    InpWindowMin      = 5;      // Window length (minutes)
 input int    InpEntryLeadMin   = 2;      // Enter with N minutes left
 
 //--- Entry
-input bool   InpUseAtrThresh   = false;  // Threshold from ATR instead of $
+input bool   InpUseAtrThresh   = true;   // Threshold from ATR instead of $
 input double InpMoveThreshUsd  = 2.5;    // Min move from window open ($)
-input double InpMoveAtrMult    = 0.8;    // Min move (ATR multiples)
+input double InpMoveAtrMult    = 1.5;    // Min move (ATR multiples)
 input int    InpAtrPeriod      = 14;     // ATR period
 input bool   InpRequireAlign   = true;   // Signal bar must close with the move
 input double InpMinBodyPct     = 40.0;   // Min signal-bar body (% of range)
@@ -45,9 +45,10 @@ input double InpTargetR        = 1.0;    // Target (R multiples)
 input double InpRiskPct        = 0.5;    // Risk per trade (% equity)
 input int    InpMaxTradesDay   = 20;     // Max trades per day
 input double InpDailyLossPct   = 3.0;    // Daily loss stop (% equity)
-input double InpMinAtr         = 0.5;    // Min ATR to trade ($)
-input double InpMaxAtr         = 15.0;   // Max ATR to trade ($)
-input int    InpMaxSpreadPts   = 40;     // Max spread (points), 0 = ignore
+input double InpMinAtr         = 0.0;    // Min ATR to trade ($), 0 = off
+input double InpMaxAtr         = 0.0;    // Max ATR to trade ($), 0 = off
+input double InpMaxSpreadUsd   = 0.0;    // Max spread ($), 0 = off
+input bool   InpVerbose        = true;   // Log why entries are skipped
 
 //--- Session (server time). Set both to 0 to trade around the clock.
 input int    InpSessionStartHr = 0;
@@ -62,6 +63,24 @@ CPositionInfo  pos;
 
 int      atrHandle   = INVALID_HANDLE;
 datetime lastBarTime = 0;
+
+// Window state, tracked forward bar by bar. Deriving it with iBarShift() was
+// wrong: gold M1 has minutes with no ticks, so the bar that opens a window is
+// often absent and an exact lookup returned -1, silently voiding the window.
+long   curWinId   = -1;
+double curWinOpen = 0.0;
+
+// Diagnostics — a strategy that takes no trades must be able to say why.
+int signalBars    = 0;   // bars that reached the entry slot
+int rejGovernor   = 0;   // halted / max trades / out of session
+int rejNoAtr      = 0;   // ATR not ready
+int rejAtrBand    = 0;   // outside min/max ATR
+int rejSpread     = 0;   // spread too wide
+int rejNoWinOpen  = 0;   // window open unknown
+int rejBody       = 0;   // signal bar body too small
+int rejMove       = 0;   // move below threshold
+int rejLots       = 0;   // risk budget below min lot
+int entriesSent   = 0;
 
 // Daily governor
 datetime dayStamp        = 0;
@@ -102,6 +121,14 @@ void OnDeinit(const int reason)
 {
    if(atrHandle != INVALID_HANDLE)
       IndicatorRelease(atrHandle);
+
+   PrintFormat("=== MIC funnel === entry slots:%d  sent:%d", signalBars, entriesSent);
+   PrintFormat("    rejected — move:%d body:%d governor:%d atr_band:%d atr_na:%d spread:%d win_open:%d lots:%d",
+               rejMove, rejBody, rejGovernor, rejAtrBand, rejNoAtr, rejSpread, rejNoWinOpen, rejLots);
+   if(signalBars == 0)
+      Print("    No bars reached the entry slot — check that the tester has M1 history and the chart is M1.");
+   else if(entriesSent == 0)
+      Print("    Entry slots were reached but every one was filtered. The largest counter above is the cause.");
 }
 
 //+------------------------------------------------------------------+
@@ -121,9 +148,17 @@ void OnTick()
    if(closedBar == 0)
       return;
 
-   long   winMs      = (long)InpWindowMin * 60;
-   long   secIntoWin = (long)closedBar % winMs;
+   long   winSec     = (long)InpWindowMin * 60;
+   long   winId      = (long)closedBar / winSec;
+   long   secIntoWin = (long)closedBar % winSec;
    int    minsLeft   = InpWindowMin - (int)(secIntoWin / 60) - 1;
+
+   // First bar seen inside a new window defines that window's open price.
+   if(winId != curWinId)
+   {
+      curWinId   = winId;
+      curWinOpen = iOpen(_Symbol, PERIOD_M1, 1);
+   }
 
    if(minsLeft == 0)
    {
@@ -137,29 +172,47 @@ void OnTick()
    if(HasPosition())
       return;
 
-   TryEnter(closedBar, winMs);
+   TryEnter(closedBar);
 }
 
 //+------------------------------------------------------------------+
-void TryEnter(const datetime signalBar, const long winMs)
+void TryEnter(const datetime signalBar)
 {
+   signalBars++;
    if(haltedToday || tradesToday >= InpMaxTradesDay || !InSession(signalBar))
-      return;
-
-   double atr = Atr();
-   if(atr <= 0.0 || atr < InpMinAtr || atr > InpMaxAtr)
-      return;
-
-   if(InpMaxSpreadPts > 0)
    {
-      long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-      if(spread > InpMaxSpreadPts)
-         return;
+      rejGovernor++;
+      return;
    }
 
-   double winOpen = WindowOpen(signalBar, winMs);
-   if(winOpen <= 0.0)
+   double atr = Atr();
+   if(atr <= 0.0)
+   {
+      rejNoAtr++;
       return;
+   }
+   if((InpMinAtr > 0.0 && atr < InpMinAtr) || (InpMaxAtr > 0.0 && atr > InpMaxAtr))
+   {
+      rejAtrBand++;
+      return;
+   }
+
+   if(InpMaxSpreadUsd > 0.0)
+   {
+      double spreadUsd = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(spreadUsd > InpMaxSpreadUsd)
+      {
+         rejSpread++;
+         return;
+      }
+   }
+
+   if(curWinOpen <= 0.0)
+   {
+      rejNoWinOpen++;
+      return;
+   }
+   double winOpen = curWinOpen;
 
    double o = iOpen (_Symbol, PERIOD_M1, 1);
    double h = iHigh (_Symbol, PERIOD_M1, 1);
@@ -172,7 +225,10 @@ void TryEnter(const datetime signalBar, const long winMs)
    double range   = h - l;
    double bodyPct = range > 0.0 ? MathAbs(c - o) / range * 100.0 : 0.0;
    if(bodyPct < InpMinBodyPct)
+   {
+      rejBody++;
       return;
+   }
 
    bool alignedUp   = !InpRequireAlign || c > o;
    bool alignedDown = !InpRequireAlign || c < o;
@@ -180,7 +236,13 @@ void TryEnter(const datetime signalBar, const long winMs)
    bool goLong  = InpAllowLong  && move >=  threshold && alignedUp;
    bool goShort = InpAllowShort && move <= -threshold && alignedDown;
    if(!goLong && !goShort)
+   {
+      rejMove++;
+      if(InpVerbose && MathAbs(move) >= threshold * 0.5)
+         PrintFormat("skip @%s move=%.2f thresh=%.2f atr=%.2f body=%.0f%%",
+                     TimeToString(signalBar, TIME_MINUTES), move, threshold, atr, bodyPct);
       return;
+   }
 
    double stopDist = InpUseAtrStop ? atr * InpStopAtrMult : InpStopUsd;
    if(stopDist <= 0.0)
@@ -188,7 +250,10 @@ void TryEnter(const datetime signalBar, const long winMs)
 
    double lots = LotsForRisk(stopDist);
    if(lots <= 0.0)
+   {
+      rejLots++;
       return;
+   }
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -209,21 +274,12 @@ void TryEnter(const datetime signalBar, const long winMs)
    }
 
    if(ok)
+   {
       tradesToday++;
+      entriesSent++;
+   }
    else
       PrintFormat("Order rejected: retcode=%d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
-}
-
-//+------------------------------------------------------------------+
-//| Open of the M1 bar that started the window containing signalBar.  |
-//+------------------------------------------------------------------+
-double WindowOpen(const datetime signalBar, const long winMs)
-{
-   datetime winStart = (datetime)((long)signalBar - ((long)signalBar % winMs));
-   int shift = iBarShift(_Symbol, PERIOD_M1, winStart, true);
-   if(shift < 0)
-      return(0.0);   // gap or missing history — skip the window rather than guess
-   return(iOpen(_Symbol, PERIOD_M1, shift));
 }
 
 //+------------------------------------------------------------------+
