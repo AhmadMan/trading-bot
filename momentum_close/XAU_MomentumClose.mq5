@@ -14,7 +14,7 @@
 //| something.                                                        |
 //+------------------------------------------------------------------+
 #property copyright "trading-bot"
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -44,9 +44,9 @@ input bool   InpUseTarget      = false;  // Use profit target
 input double InpTargetR        = 1.0;    // Target (R multiples)
 
 //--- Risk
-input double InpRiskPct        = 0.5;    // Risk per trade (% equity)
-input int    InpMaxTradesDay   = 200;    // Max trades per day (adds count)
-input double InpDailyLossPct   = 3.0;    // Daily loss stop (% equity)
+input double InpRiskPct        = 0.3;    // Risk per trade (% equity)
+input int    InpMaxTradesDay   = 100;    // Max trades per day (adds count)
+input double InpDailyLossPct   = 2.5;    // Daily loss stop (% equity)
 input double InpMinAtr         = 0.0;    // Min ATR to trade ($), 0 = off
 input double InpMaxAtr         = 0.0;    // Max ATR to trade ($), 0 = off
 input double InpMaxSpreadUsd   = 0.0;    // Max spread ($), 0 = off
@@ -57,9 +57,19 @@ input bool   InpCalibrate      = false;  // Measure moves, place no trades
 // A contiguous start/end window cannot express "every hour except 23", which
 // is the hour whose trades hold through the daily rollover and weekend gaps.
 // InpBlockHours removes individual hours regardless of the session window.
-input string InpBlockHours     = "";     // Hours to skip, e.g. "23" or "23,0,22"
+input string InpBlockHours     = "23";   // Hours to skip, e.g. "23" or "23,0,22"
 input int    InpSessionStartHr = 0;
 input int    InpSessionEndHr   = 0;
+
+//--- Gap protection
+// Both backtests to date owed nearly all of their net profit to a handful of
+// positions opened just before the Friday close and exited after the weekend
+// gap. Those are not this strategy's edge, they are a lottery on the gap, and
+// the same mechanism produced every one of the five largest losses. These two
+// inputs remove that trade so the remaining sample answers the actual
+// question: does late-window momentum in gold pay for its own spread?
+input int    InpNoEntryFriHr   = 21;     // No new entries Friday from this hour, 0 = off
+input int    InpMaxHoldMin     = 15;     // Force-flat a position older than N min, 0 = off
 
 //--- Plumbing
 input long   InpMagic          = 590105;
@@ -193,6 +203,7 @@ void OnTick()
    lastBarTime = barTime;
 
    RollDay();
+   EnforceMaxHold();
 
    MqlDateTime fd;
    TimeToStruct(closedBarOrNow(), fd);
@@ -281,7 +292,7 @@ void TryEnter(const datetime signalBar)
       rejGovernor++;
       return;
    }
-   if(IsBlockedHour(signalBar))
+   if(IsBlockedHour(signalBar) || IsFridayCutoff(signalBar))
    {
       rejBlockedHour++;
       return;
@@ -510,6 +521,47 @@ void CloseAll(const string reason)
       if(pos.SelectByIndex(i) && pos.Symbol() == _Symbol && pos.Magic() == InpMagic)
          if(!trade.PositionClose(pos.Ticket(), InpSlippagePts))
             PrintFormat("Close failed (%s): retcode=%d", reason, trade.ResultRetcode());
+}
+
+//+------------------------------------------------------------------+
+//| Friday cutoff. The window clock cannot flatten a position when the |
+//| market stops producing bars, so the only reliable guard against    |
+//| holding over the weekend is to not open the position at all.       |
+//+------------------------------------------------------------------+
+bool IsFridayCutoff(const datetime t)
+{
+   if(InpNoEntryFriHr <= 0)
+      return(false);
+
+   MqlDateTime st;
+   TimeToStruct(t, st);
+   return(st.day_of_week == 5 && st.hour >= InpNoEntryFriHr);
+}
+
+//+------------------------------------------------------------------+
+//| Backstop for the case the window clock misses: a position that     |
+//| outlives its window (a gap, a halt, a missed bar) is closed on the |
+//| first tick after the limit. Wall-clock, not bar-counted, so it     |
+//| still fires when no bars printed in between.                       |
+//+------------------------------------------------------------------+
+void EnforceMaxHold()
+{
+   if(InpMaxHoldMin <= 0)
+      return;
+
+   long limit = (long)InpMaxHoldMin * 60;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!pos.SelectByIndex(i) || pos.Symbol() != _Symbol || pos.Magic() != InpMagic)
+         continue;
+      if((long)TimeCurrent() - (long)pos.Time() < limit)
+         continue;
+      if(!trade.PositionClose(pos.Ticket(), InpSlippagePts))
+         PrintFormat("Max-hold close failed: retcode=%d", trade.ResultRetcode());
+      else if(InpVerbose)
+         PrintFormat("Max-hold flat: ticket=%I64u held=%d min", pos.Ticket(),
+                     (int)(((long)TimeCurrent() - (long)pos.Time()) / 60));
+   }
 }
 
 //+------------------------------------------------------------------+

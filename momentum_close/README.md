@@ -123,3 +123,44 @@ not survive inspection, and the same checks apply to any later run:
   minimum lot, the EA stands down instead of oversizing.
 - `InpMaxSpreadPts` blocks entries when the spread is wide. Set it from your
   broker's typical XAU spread, not from the default.
+
+## Final build (v1.10) — recommended defaults
+
+Shipped defaults now match every recommendation from the two Strategy Tester
+runs analysed so far:
+
+| Input | Default | Why |
+|---|---|---|
+| `InpBlockHours` | `"23"` | The 23:00 hour is where entries hold through the daily rollover. |
+| `InpNoEntryFriHr` | `21` | No new entries late Friday. The window clock cannot flatten a position once the market stops printing bars, so the only reliable guard is not to open it. |
+| `InpMaxHoldMin` | `15` | Backstop, wall-clock not bar-counted: any position outliving three windows is closed on the first tick after the limit, whatever the bar stream did. |
+| `InpRiskPct` | `0.3` | Run 2 raised net profit over run 1 purely by raising risk; every quality metric fell. Keep risk fixed while the edge is unproven. |
+| `InpUseTarget` | `false` | Unchanged, but note it is what let the weekend gap run in run 2. |
+| `InpMaxTradesDay` | `100`, `InpDailyLossPct` `2.5` | Match the last tested configuration. |
+| `InpAllowAdds` | `false` | Adds correlate trades. Keep them independent observations until the edge question is settled. |
+
+### Set commission before reading any result
+
+Both runs so far reported `$0.00` commission on every deal. At a typical
+$6/lot round turn that is roughly 62% of run 1's net profit. A backtest with
+zero commission is not a backtest of this strategy. Set the tester's
+commission to your broker's real figure first.
+
+### What these defaults are for
+
+They are not a claim that the strategy works. Two runs, 2,450 trades:
+profit factor 1.09 and 1.07, LR correlation 0.47 and 0.44, and in run 2 a
+single Friday-night gap fill accounted for 93% of the $12,844.92 net — the
+other 1,208 trades made $943.32 against a 13.47% drawdown. The gap trades
+that produced the profit are the same mechanism that produced all five
+largest losses.
+
+This build removes that trade. Re-run it, with real commission, and read the
+result as the first honest measurement of the underlying idea:
+
+1. Same period (Jun 1 – Sep 8 2026) with commission on, as the baseline.
+2. An out-of-sample period (e.g. Jan – May 2026), settings untouched.
+3. Only if both clear a profit factor near 1.2 with LR correlation above
+   0.85, walk the move threshold and entry lead.
+
+If step 1 lands near breakeven, that is the answer, and it is a useful one.
