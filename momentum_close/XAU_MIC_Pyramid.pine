@@ -117,15 +117,15 @@ if strategy.position_size != 0
     if anchorReady
         stopPrice := isLong ? anchorLow : anchorHi
     else if useSafetyStop and not na(atr)
-        stopPrice := isLong ? strategy.position_avg_price - atr * safetyAtr
-                            : strategy.position_avg_price + atr * safetyAtr
+        safetyDist = atr * safetyAtr
+        stopPrice := isLong ? strategy.position_avg_price - safetyDist : strategy.position_avg_price + safetyDist
 
 if strategy.position_size != 0 and not na(stopPrice)
     strategy.exit('stop', stop=stopPrice)
 
 // ── Plots ───────────────────────────────────────────────────────────────────
 plot(winOpen, 'Window open', color.new(color.gray, 50), style=plot.style_stepline)
-plot(strategy.position_size != 0 and not na(stopPrice) ? stopPrice : na, 'Stop',
-     color=anchorReady ? color.red : color.orange, style=plot.style_linebr, linewidth=2)
+stopPlot = strategy.position_size != 0 and not na(stopPrice) ? stopPrice : na
+plot(stopPlot, 'Stop', color=anchorReady ? color.red : color.orange, style=plot.style_linebr, linewidth=2)
 plotshape(longSignal,  'Buy',  shape.triangleup,   location.belowbar, color.new(color.teal, 0), size=size.tiny)
 plotshape(shortSignal, 'Sell', shape.triangledown, location.abovebar, color.new(color.red,  0), size=size.tiny)

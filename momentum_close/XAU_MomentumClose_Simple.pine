@@ -41,8 +41,8 @@ if minsLeft == leadMin and strategy.position_size == 0 and not na(atr)
 
 // Protective stop while the trade is open.
 if strategy.position_size != 0
-    stop = strategy.position_size > 0 ? strategy.position_avg_price - atr * stopMult
-                                      : strategy.position_avg_price + atr * stopMult
+    dist = atr * stopMult
+    stop = strategy.position_size > 0 ? strategy.position_avg_price - dist : strategy.position_avg_price + dist
     strategy.exit('X', stop=stop)
 
 // Exit: the window ends.
