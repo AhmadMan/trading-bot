@@ -65,6 +65,7 @@ CTrade         trade;
 CPositionInfo  pos;
 
 int      atrHandle   = INVALID_HANDLE;
+int      barMin      = 1;   // chart timeframe in minutes
 datetime lastBarTime = 0;
 
 // Window state, tracked forward bar by bar. Deriving it with iBarShift() was
@@ -110,16 +111,35 @@ int OnInit()
    // minsLeft steps down one minute per M1 bar, so any whole-minute lead below
    // the window length is reachable. This is why the M1 requirement above is
    // not cosmetic: on an M5 chart minsLeft would skip the lead entirely.
-   if(InpWindowMin % 1 != 0)
-      return(INIT_PARAMETERS_INCORRECT);
-   if(Period() != PERIOD_M1)
+
+   // Adapt to whatever timeframe the chart or tester supplies instead of
+   // demanding M1. Refusing to start was silently indistinguishable from
+   // taking no trades, which cost several rounds of misdiagnosis.
+   int tfSec = PeriodSeconds();
+   if(tfSec < 60 || tfSec > 3600 || tfSec % 60 != 0)
    {
-      PrintFormat("Attach to an M1 chart - the window clock counts whole minutes. Got %s.",
+      PrintFormat("Use a whole-minute timeframe from M1 to H1. Got %s.",
                   EnumToString((ENUM_TIMEFRAMES)Period()));
       return(INIT_PARAMETERS_INCORRECT);
    }
+   barMin = tfSec / 60;
 
-   atrHandle = iATR(_Symbol, PERIOD_M1, InpAtrPeriod);
+   if(InpWindowMin % barMin != 0)
+   {
+      PrintFormat("Window (%d min) must be a whole multiple of the %d-minute timeframe.",
+                  InpWindowMin, barMin);
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   // minsLeft moves in steps of one bar, so a lead that is not a multiple of
+   // the timeframe is never reached and the EA would run but never enter.
+   if(InpEntryLeadMin % barMin != 0)
+   {
+      PrintFormat("Entry lead (%d min) must be a multiple of the %d-minute timeframe. Valid leads here: %d, %d, %d ...",
+                  InpEntryLeadMin, barMin, barMin, barMin * 2, barMin * 3);
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   atrHandle = iATR(_Symbol, Period(), InpAtrPeriod);
    if(atrHandle == INVALID_HANDLE)
    {
       Print("Failed to create ATR handle.");
@@ -162,7 +182,7 @@ void OnTick()
    // Everything is decided on closed M1 bars, matching the Pine version's
    // calc_on_every_tick=false. Intrabar ticks only matter for the broker-side
    // stop, which is already sitting on the server.
-   datetime barTime = iTime(_Symbol, PERIOD_M1, 0);
+   datetime barTime = iTime(_Symbol, Period(), 0);
    if(barTime == lastBarTime)
       return;
    lastBarTime = barTime;
@@ -179,20 +199,20 @@ void OnTick()
       lastFunnelDay = StructToTime(fd);
    }
 
-   datetime closedBar = iTime(_Symbol, PERIOD_M1, 1);
+   datetime closedBar = iTime(_Symbol, Period(), 1);
    if(closedBar == 0)
       return;
 
    long   winSec     = (long)InpWindowMin * 60;
    long   winId      = (long)closedBar / winSec;
    long   secIntoWin = (long)closedBar % winSec;
-   int    minsLeft   = InpWindowMin - (int)(secIntoWin / 60) - 1;
+   int    minsLeft   = InpWindowMin - (int)(secIntoWin / 60) - barMin;
 
    // First bar seen inside a new window defines that window's open price.
    if(winId != curWinId)
    {
       curWinId   = winId;
-      curWinOpen = iOpen(_Symbol, PERIOD_M1, 1);
+      curWinOpen = iOpen(_Symbol, Period(), 1);
    }
 
    if(minsLeft == 0)
@@ -217,7 +237,7 @@ void OnTick()
 //+------------------------------------------------------------------+
 datetime closedBarOrNow()
 {
-   datetime t = iTime(_Symbol, PERIOD_M1, 1);
+   datetime t = iTime(_Symbol, Period(), 1);
    return(t == 0 ? TimeCurrent() : t);
 }
 
@@ -285,10 +305,10 @@ void TryEnter(const datetime signalBar)
    }
    double winOpen = curWinOpen;
 
-   double o = iOpen (_Symbol, PERIOD_M1, 1);
-   double h = iHigh (_Symbol, PERIOD_M1, 1);
-   double l = iLow  (_Symbol, PERIOD_M1, 1);
-   double c = iClose(_Symbol, PERIOD_M1, 1);
+   double o = iOpen (_Symbol, Period(), 1);
+   double h = iHigh (_Symbol, Period(), 1);
+   double l = iLow  (_Symbol, Period(), 1);
+   double c = iClose(_Symbol, Period(), 1);
 
    double move      = c - winOpen;
    double threshold = InpUseAtrThresh ? atr * InpMoveAtrMult : InpMoveThreshUsd;
