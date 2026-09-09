@@ -33,6 +33,8 @@ input bool   InpRequireAlign   = false;  // Signal bar must close with the move
 input double InpMinBodyPct     = 0.0;    // Min signal-bar body (% of range)
 input bool   InpAllowLong      = true;
 input bool   InpAllowShort     = true;
+input bool   InpAllowAdds      = false;  // Take signals while already in a trade
+input int    InpMaxAdds        = 10;     // Max stacked entries per direction
 
 //--- Exit
 input bool   InpUseAtrStop     = true;   // Stop from ATR instead of $
@@ -43,7 +45,7 @@ input double InpTargetR        = 1.0;    // Target (R multiples)
 
 //--- Risk
 input double InpRiskPct        = 0.5;    // Risk per trade (% equity)
-input int    InpMaxTradesDay   = 20;     // Max trades per day
+input int    InpMaxTradesDay   = 200;    // Max trades per day (adds count)
 input double InpDailyLossPct   = 3.0;    // Daily loss stop (% equity)
 input double InpMinAtr         = 0.0;    // Min ATR to trade ($), 0 = off
 input double InpMaxAtr         = 0.0;    // Max ATR to trade ($), 0 = off
@@ -81,6 +83,9 @@ int rejNoWinOpen  = 0;   // window open unknown
 int rejBody       = 0;   // signal bar body too small
 int rejMove       = 0;   // move below threshold
 int rejLots       = 0;   // risk budget below min lot
+int rejOpposite   = 0;   // opposite signal while in a position
+int rejMaxAdds    = 0;   // add limit reached
+int addCount      = 0;   // stacked entries in the current position
 int entriesSent   = 0;
 
 // Calibration samples: |move| expressed in ATR multiples at each entry slot.
@@ -193,13 +198,17 @@ void OnTick()
    if(minsLeft == 0)
    {
       CloseAll("window close");
+      addCount = 0;
       return;
    }
+
+   if(!HasPosition())
+      addCount = 0;
 
    if(minsLeft != InpEntryLeadMin)
       return;
 
-   if(HasPosition())
+   if(HasPosition() && !InpAllowAdds)
       return;
 
    TryEnter(closedBar);
@@ -218,6 +227,7 @@ void PrintFunnel(const string tag)
    PrintFormat("=== MIC funnel (%s) === entry slots:%d  sent:%d", tag, signalBars, entriesSent);
    PrintFormat("    rejected - move:%d body:%d governor:%d atr_band:%d atr_na:%d spread:%d win_open:%d lots:%d",
                rejMove, rejBody, rejGovernor, rejAtrBand, rejNoAtr, rejSpread, rejNoWinOpen, rejLots);
+   PrintFormat("    rejected - opposite_signal:%d max_adds:%d", rejOpposite, rejMaxAdds);
 
    if(sampleCount > 0)
    {
@@ -318,6 +328,25 @@ void TryEnter(const datetime signalBar)
       return;
    }
 
+   // Under netting an opposite order reduces the open position instead of
+   // opening a new trade, which is not what the signal means. Skip it and let
+   // the window boundary do the flattening.
+   int    openDir = PositionDir();
+   int    wantDir = goLong ? 1 : -1;
+   if(openDir != 0)
+   {
+      if(openDir != wantDir)
+      {
+         rejOpposite++;
+         return;
+      }
+      if(addCount >= InpMaxAdds)
+      {
+         rejMaxAdds++;
+         return;
+      }
+   }
+
    double stopDist = InpUseAtrStop ? atr * InpStopAtrMult : InpStopUsd;
    if(stopDist <= 0.0)
       return;
@@ -351,6 +380,10 @@ void TryEnter(const datetime signalBar)
    {
       tradesToday++;
       entriesSent++;
+      addCount++;
+      // A netted position has one average price and one stop, so every add
+      // moves the stop; without this the bracket still refers to the first fill.
+      ResetStopFromAverage(stopDist);
    }
    else
       PrintFormat("Order rejected: retcode=%d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
@@ -396,6 +429,39 @@ double Atr()
    if(CopyBuffer(atrHandle, 0, 1, 1, buf) != 1)
       return(0.0);
    return(buf[0]);
+}
+
+//+------------------------------------------------------------------+
+//| +1 long, -1 short, 0 flat, for this symbol and magic.              |
+//+------------------------------------------------------------------+
+int PositionDir()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+      if(pos.SelectByIndex(i) && pos.Symbol() == _Symbol && pos.Magic() == InpMagic)
+         return(pos.PositionType() == POSITION_TYPE_BUY ? 1 : -1);
+   return(0);
+}
+
+//+------------------------------------------------------------------+
+void ResetStopFromAverage(const double stopDist)
+{
+   int dg = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!pos.SelectByIndex(i) || pos.Symbol() != _Symbol || pos.Magic() != InpMagic)
+         continue;
+
+      bool   isLong = pos.PositionType() == POSITION_TYPE_BUY;
+      double avg    = pos.PriceOpen();
+      double sl     = NormalizeDouble(isLong ? avg - stopDist : avg + stopDist, dg);
+      double tp     = InpUseTarget
+                    ? NormalizeDouble(isLong ? avg + stopDist * InpTargetR : avg - stopDist * InpTargetR, dg)
+                    : 0.0;
+
+      if(MathAbs(pos.StopLoss() - sl) > SymbolInfoDouble(_Symbol, SYMBOL_POINT))
+         if(!trade.PositionModify(pos.Ticket(), sl, tp))
+            PrintFormat("Stop re-anchor failed: retcode=%d", trade.ResultRetcode());
+   }
 }
 
 //+------------------------------------------------------------------+

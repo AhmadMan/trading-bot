@@ -76,6 +76,25 @@ The honest prior is that this fails. Late-window continuation in a liquid
 is wide relative to a $2.50 move. The value of these two files is that they
 settle the question cheaply.
 
+## Stacking signals (allowAdds / InpAllowAdds)
+
+Off by default: one trade at a time, so a signal firing before the window
+closes is skipped. Turning it on takes every signal and stacks the position.
+
+Two things behave differently in MT5 than in Pine, because MT5 nets:
+
+- An opposite signal while a position is open would *reduce* the netted
+  position rather than open a new trade, so the EA skips it and lets the
+  window boundary flatten instead. Pine would reverse. The funnel counts these
+  under `opposite_signal`.
+- A netted position has one average price and one stop, so every add
+  re-anchors the stop to the new average. Pine keeps a stop per entry.
+
+Read the results knowing that stacked entries are not independent trades —
+they are one directional bet counted several times, so profit factor
+flatters and drawdown understates. For deciding whether the edge is real,
+leave adds off.
+
 ## EA notes
 
 - Attach to an **M1** chart; the window clock counts whole minutes.
