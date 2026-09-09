@@ -1,0 +1,52 @@
+//@version=6
+// Momentum into the close — minimal version.
+//
+// Cut the clock into 5-minute windows. Two minutes before a window ends, if
+// price has moved far enough from where the window opened, go with the move.
+// Close the trade when the window ends. That is the whole idea.
+//
+// Run on XAUUSD, 1-minute. Four inputs.
+
+strategy('XAU Momentum Into Close (simple)', shorttitle='XAU_MIC_S', overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     commission_type=strategy.commission.percent,
+     commission_value=0.01)
+
+winMin   = input.int(5,   'Window (minutes)')
+leadMin  = input.int(2,   'Enter with N minutes left')
+atrMult  = input.float(1.0, 'Move needed (x ATR)', step=0.1)
+stopMult = input.float(2.0, 'Stop (x ATR)',        step=0.1)
+
+atr = ta.atr(14)
+
+// Which window this bar belongs to, and how many whole minutes are left in it.
+winId    = math.floor(time / (winMin * 60000))
+minsLeft = winMin - int(time % (winMin * 60000) / 60000) - 1
+
+// The window's opening price.
+var float winOpen = na
+if winId != winId[1]
+    winOpen := open
+
+move = close - winOpen
+
+// Entry: at the lead bar, with the move, if it is big enough.
+if minsLeft == leadMin and strategy.position_size == 0 and not na(atr)
+    if move >= atr * atrMult
+        strategy.entry('L', strategy.long)
+    else if move <= -atr * atrMult
+        strategy.entry('S', strategy.short)
+
+// Protective stop while the trade is open.
+if strategy.position_size != 0
+    stop = strategy.position_size > 0 ? strategy.position_avg_price - atr * stopMult
+                                      : strategy.position_avg_price + atr * stopMult
+    strategy.exit('X', stop=stop)
+
+// Exit: the window ends.
+if minsLeft == 0
+    strategy.close_all()
+
+plot(winOpen, 'Window open', color.gray, style=plot.style_stepline)
