@@ -164,3 +164,46 @@ result as the first honest measurement of the underlying idea:
    0.85, walk the move threshold and entry lead.
 
 If step 1 lands near breakeven, that is the answer, and it is a useful one.
+
+## Prop-firm (FTMO) guards and fixed sizing — v1.20
+
+### Sizing
+
+| Input | Default | What it does |
+|---|---|---|
+| `InpUseFixedLot` | `false` | Trade `InpFixedLots` on every entry instead of risk-% sizing. |
+| `InpFixedLots` | `0.10` | The fixed size. |
+| `InpMaxLots` | `0.0` | Hard ceiling on any lot, 0 = broker maximum. |
+
+Risk-% sizing compounds: in the 60-minute run it grew positions from 0.5 lots in
+June to 5.36 lots in September, which flatters the curve on the way up and hurts
+disproportionately in a losing streak. Fixed lots make every trade the same size,
+so the equity curve measures the edge rather than the compounding. **Test with
+fixed lots; trade with whichever you have decided you want.**
+
+### FTMO guards
+
+All limits are measured on **equity** (floating P/L included) against the
+**balance at the start of the prop day** — that is how the firm measures them —
+and they are checked on **every tick**, not on bar close. The daily governor
+already in the EA (`InpDailyLossPct`) checks only on new bars and measures from
+day-start equity; it stays as a strategy-level brake, but it is not a prop-rule
+guard and must not be relied on as one.
+
+| Input | Default | What it does |
+|---|---|---|
+| `InpFtmoEnable` | `false` | Turn the guards on. |
+| `InpFtmoDailyPct` | `4.0` | Close everything and stop for the day at this loss. |
+| `InpFtmoMaxPct` | `8.0` | Overall loss from the starting balance. **Terminal** — the EA never trades again this run. |
+| `InpFtmoStartBal` | `0.0` | Account starting balance; 0 captures the balance when the EA attaches. |
+| `InpFtmoResetHr` | `0` | Server hour the prop day rolls, when the broker clock differs from the firm's. |
+| `InpFtmoTargetPct` | `0.0` | Optionally stop for the day at +N%, so a good day is not given back. |
+
+The defaults sit **inside** FTMO's 5% / 10% limits on purpose. A guard set at
+exactly 5% closes the position *at* the limit, and the slippage on that close is
+enough to breach it. The 1–2% buffer is what makes the guard a guard.
+
+Two things it cannot do: a limit breached by a weekend gap happens with no ticks
+to act on (which is what `InpNoEntryFriHr`, now `19`, is for), and it governs
+only positions carrying `InpMagic` on this symbol — anything you trade manually
+in the same account is invisible to it and still counts against your limits.

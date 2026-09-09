@@ -14,7 +14,7 @@
 //| something.                                                        |
 //+------------------------------------------------------------------+
 #property copyright "trading-bot"
-#property version   "1.10"
+#property version   "1.20"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -43,6 +43,14 @@ input double InpStopAtrMult    = 1.5;    // Stop distance (ATR mult)
 input bool   InpUseTarget      = false;  // Use profit target
 input double InpTargetR        = 1.0;    // Target (R multiples)
 
+//--- Sizing
+// Fixed lots make every trade the same size, so the backtest is a clean sample
+// of the edge rather than a compounding curve. Risk-% sizing grows positions as
+// equity grows, which is what pushed run 3 from 0.5 to 5.36 lots.
+input bool   InpUseFixedLot    = false;  // Trade a fixed lot instead of risk %
+input double InpFixedLots      = 0.10;   // Lot size when fixed sizing is on
+input double InpMaxLots        = 0.0;    // Hard lot cap, 0 = broker maximum
+
 //--- Risk
 input double InpRiskPct        = 0.3;    // Risk per trade (% equity)
 input int    InpMaxTradesDay   = 100;    // Max trades per day (adds count)
@@ -61,6 +69,19 @@ input string InpBlockHours     = "23";   // Hours to skip, e.g. "23" or "23,0,22
 input int    InpSessionStartHr = 0;
 input int    InpSessionEndHr   = 0;
 
+//--- FTMO / prop-firm guards
+// Prop rules are measured on EQUITY, floating P/L included, against the
+// balance at the start of the trading day - not against day-start equity and
+// not on bar close. So these are checked on every tick and reference balance.
+// Defaults sit inside FTMO's 5% / 10% limits so the buffer absorbs slippage on
+// the closing trade; a breach that closes at the limit is still a breach.
+input bool   InpFtmoEnable     = false;  // Enforce prop-firm loss limits
+input double InpFtmoDailyPct   = 4.0;    // Daily loss limit (% of day-start balance)
+input double InpFtmoMaxPct     = 8.0;    // Overall loss limit (% of start balance)
+input double InpFtmoStartBal   = 0.0;    // Account start balance, 0 = balance at attach
+input int    InpFtmoResetHr    = 0;      // Server hour the prop day resets
+input double InpFtmoTargetPct  = 0.0;    // Stop for the day at +N% profit, 0 = off
+
 //--- Gap protection
 // Both backtests to date owed nearly all of their net profit to a handful of
 // positions opened just before the Friday close and exited after the weekend
@@ -68,7 +89,7 @@ input int    InpSessionEndHr   = 0;
 // the same mechanism produced every one of the five largest losses. These two
 // inputs remove that trade so the remaining sample answers the actual
 // question: does late-window momentum in gold pay for its own spread?
-input int    InpNoEntryFriHr   = 21;     // No new entries Friday from this hour, 0 = off
+input int    InpNoEntryFriHr   = 19;     // No new entries Friday from this hour, 0 = off
 input int    InpMaxHoldMin     = 15;     // Force-flat a position older than N min, 0 = off
 
 //--- Plumbing
@@ -112,8 +133,14 @@ datetime lastFunnelDay = 0;
 // Daily governor
 datetime dayStamp        = 0;
 double   dayStartEquity  = 0.0;
+double   dayStartBalance = 0.0;   // FTMO measures the daily limit against this
 int      tradesToday     = 0;
 bool     haltedToday     = false;
+
+// Prop-firm state. ftmoStartBal anchors the overall limit for the life of the
+// account, so it is captured once and never rolled with the day.
+double   ftmoStartBal    = 0.0;
+bool     ftmoBreached    = false;  // overall limit hit: stop trading permanently
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -165,13 +192,35 @@ int OnInit()
    trade.SetDeviationInPoints(InpSlippagePts);
    trade.SetTypeFillingBySymbol(_Symbol);
 
+   if(InpUseFixedLot && InpFixedLots <= 0.0)
+   {
+      Print("Fixed sizing is on but InpFixedLots is 0.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   if(InpFtmoEnable && InpFtmoDailyPct >= InpFtmoMaxPct)
+      Print("Warning: daily limit is not below the overall limit — one day can end the account.");
+
+   // Anchored once, for the life of the run: the overall limit is measured from
+   // the account's original balance, so it must not move with deposits or with
+   // the daily reset.
+   ftmoStartBal = (InpFtmoStartBal > 0.0) ? InpFtmoStartBal
+                                          : AccountInfoDouble(ACCOUNT_BALANCE);
+
    ResetDay();
+
+   if(InpFtmoEnable)
+      PrintFormat("FTMO guard ON | start balance %.2f | daily -%.2f%% | overall -%.2f%% | target %s | day resets %02d:00",
+                  ftmoStartBal, InpFtmoDailyPct, InpFtmoMaxPct,
+                  InpFtmoTargetPct > 0.0 ? StringFormat("+%.2f%%", InpFtmoTargetPct) : "off",
+                  InpFtmoResetHr);
 
    // If this line is absent from the Journal, the EA never started and nothing
    // below it ran — that is a setup problem, not a signal problem.
-   PrintFormat("MIC init OK - %s %s | window=%dm lead=%dm | thresh=%s | digits=%d point=%g",
+   PrintFormat("MIC init OK - %s %s | window=%dm lead=%dm | sizing=%s | thresh=%s | digits=%d point=%g",
                _Symbol, EnumToString((ENUM_TIMEFRAMES)Period()),
                InpWindowMin, InpEntryLeadMin,
+               InpUseFixedLot ? StringFormat("fixed %.2f lots", InpFixedLots)
+                              : StringFormat("%.2f%% risk", InpRiskPct),
                InpUseAtrThresh ? StringFormat("%.2f x ATR", InpMoveAtrMult)
                                : StringFormat("$%.2f", InpMoveThreshUsd),
                (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS),
@@ -194,6 +243,11 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // Prop limits are breached intrabar, not on bar close, so this runs on every
+   // tick and before anything else. Everything below it is bar-gated.
+   if(!PropGuard())
+      return;
+
    // Everything is decided on closed M1 bars, matching the Pine version's
    // calc_on_every_tick=false. Intrabar ticks only matter for the broker-side
    // stop, which is already sitting on the server.
@@ -437,6 +491,9 @@ void TryEnter(const datetime signalBar)
 //+------------------------------------------------------------------+
 double LotsForRisk(const double stopDist)
 {
+   if(InpUseFixedLot)
+      return(ClampLots(InpFixedLots));
+
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    if(tickValue <= 0.0 || tickSize <= 0.0)
@@ -450,16 +507,29 @@ double LotsForRisk(const double stopDist)
    double riskCash = equity * InpRiskPct / 100.0;
    double lots     = riskCash / lossPerLot;
 
+   return(ClampLots(lots));
+}
+
+//+------------------------------------------------------------------+
+//| Round down to the broker's lot step and apply both the broker and |
+//| InpMaxLots ceilings. Returns 0 when the size cannot be traded at  |
+//| all, which callers treat as "stand down" rather than "use minimum".|
+//+------------------------------------------------------------------+
+double ClampLots(double lots)
+{
    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
+   if(InpMaxLots > 0.0 && maxLot > InpMaxLots)
+      maxLot = InpMaxLots;
+
+   if(lots > maxLot)
+      lots = maxLot;
    if(lotStep > 0.0)
       lots = MathFloor(lots / lotStep) * lotStep;
    if(lots < minLot)
-      return(0.0);   // risk budget cannot buy the minimum lot — stand down
-   if(lots > maxLot)
-      lots = maxLot;
+      return(0.0);
 
    return(NormalizeDouble(lots, 2));
 }
@@ -605,25 +675,99 @@ bool InSession(const datetime t)
 }
 
 //+------------------------------------------------------------------+
+//| Prop-firm limits, evaluated on every tick against live equity so  |
+//| floating losses count - which is how the firm measures them.      |
+//| Returns false when trading must stop for now; the caller returns  |
+//| immediately, so no new entry can follow a breach within the tick. |
+//+------------------------------------------------------------------+
+bool PropGuard()
+{
+   if(!InpFtmoEnable)
+      return(true);
+
+   if(ftmoBreached)
+      return(false);   // overall limit is terminal: never trade again
+
+   // The day may have rolled since the last bar; refresh the daily anchors
+   // here rather than waiting for RollDay, which only runs on a new bar.
+   if(PropDayStamp() != dayStamp)
+      ResetDay();
+
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   // Overall loss, measured from the account's starting balance for life.
+   if(ftmoStartBal > 0.0)
+   {
+      double totalPct = (equity - ftmoStartBal) / ftmoStartBal * 100.0;
+      if(totalPct <= -InpFtmoMaxPct)
+      {
+         ftmoBreached = true;
+         haltedToday  = true;
+         CloseAll("FTMO overall loss limit");
+         PrintFormat("FTMO overall limit hit: %.2f%% from start balance %.2f. Trading stopped.",
+                     totalPct, ftmoStartBal);
+         return(false);
+      }
+   }
+
+   if(haltedToday)
+      return(false);
+
+   if(dayStartBalance <= 0.0)
+      return(true);
+
+   double dayPct = (equity - dayStartBalance) / dayStartBalance * 100.0;
+
+   if(dayPct <= -InpFtmoDailyPct)
+   {
+      haltedToday = true;
+      CloseAll("FTMO daily loss limit");
+      PrintFormat("FTMO daily limit hit: %.2f%% of day-start balance %.2f. Flat until the next prop day.",
+                  dayPct, dayStartBalance);
+      return(false);
+   }
+
+   // Banking a good day is a rule of the same kind: it protects the account
+   // from giving the profit back, so it halts rather than merely reporting.
+   if(InpFtmoTargetPct > 0.0 && dayPct >= InpFtmoTargetPct)
+   {
+      haltedToday = true;
+      CloseAll("daily profit target");
+      PrintFormat("Daily profit target hit: +%.2f%%. Flat until the next prop day.", dayPct);
+      return(false);
+   }
+
+   return(true);
+}
+
+//+------------------------------------------------------------------+
 void ResetDay()
 {
-   MqlDateTime st;
-   TimeToStruct(TimeCurrent(), st);
-   st.hour = 0; st.min = 0; st.sec = 0;
+   dayStamp        = PropDayStamp();
+   dayStartEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   tradesToday     = 0;
+   haltedToday     = false;
+}
 
-   dayStamp       = StructToTime(st);
-   dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   tradesToday    = 0;
-   haltedToday    = false;
+//+------------------------------------------------------------------+
+//| Midnight of the current prop day. FTMO's day rolls at 00:00 in the|
+//| firm's timezone; InpFtmoResetHr shifts it when the broker's server|
+//| clock differs, so the guard resets when the firm's does, not when |
+//| the server date changes.                                          |
+//+------------------------------------------------------------------+
+datetime PropDayStamp()
+{
+   datetime shifted = TimeCurrent() - (long)InpFtmoResetHr * 3600;
+   MqlDateTime st;
+   TimeToStruct(shifted, st);
+   st.hour = 0; st.min = 0; st.sec = 0;
+   return(StructToTime(st));
 }
 
 void RollDay()
 {
-   MqlDateTime st;
-   TimeToStruct(TimeCurrent(), st);
-   st.hour = 0; st.min = 0; st.sec = 0;
-
-   if(StructToTime(st) != dayStamp)
+   if(PropDayStamp() != dayStamp)
    {
       ResetDay();
       return;
