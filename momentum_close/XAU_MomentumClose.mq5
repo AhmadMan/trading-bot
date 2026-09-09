@@ -54,6 +54,10 @@ input bool   InpVerbose        = true;   // Log why entries are skipped
 input bool   InpCalibrate      = false;  // Measure moves, place no trades
 
 //--- Session (server time). Set both to 0 to trade around the clock.
+// A contiguous start/end window cannot express "every hour except 23", which
+// is the hour whose trades hold through the daily rollover and weekend gaps.
+// InpBlockHours removes individual hours regardless of the session window.
+input string InpBlockHours     = "";     // Hours to skip, e.g. "23" or "23,0,22"
 input int    InpSessionStartHr = 0;
 input int    InpSessionEndHr   = 0;
 
@@ -86,6 +90,7 @@ int rejMove       = 0;   // move below threshold
 int rejLots       = 0;   // risk budget below min lot
 int rejOpposite   = 0;   // opposite signal while in a position
 int rejMaxAdds    = 0;   // add limit reached
+int rejBlockedHour= 0;   // hour listed in InpBlockHours
 int addCount      = 0;   // stacked entries in the current position
 int entriesSent   = 0;
 
@@ -247,7 +252,8 @@ void PrintFunnel(const string tag)
    PrintFormat("=== MIC funnel (%s) === entry slots:%d  sent:%d", tag, signalBars, entriesSent);
    PrintFormat("    rejected - move:%d body:%d governor:%d atr_band:%d atr_na:%d spread:%d win_open:%d lots:%d",
                rejMove, rejBody, rejGovernor, rejAtrBand, rejNoAtr, rejSpread, rejNoWinOpen, rejLots);
-   PrintFormat("    rejected - opposite_signal:%d max_adds:%d", rejOpposite, rejMaxAdds);
+   PrintFormat("    rejected - opposite_signal:%d max_adds:%d blocked_hour:%d",
+               rejOpposite, rejMaxAdds, rejBlockedHour);
 
    if(sampleCount > 0)
    {
@@ -273,6 +279,11 @@ void TryEnter(const datetime signalBar)
    if(haltedToday || tradesToday >= InpMaxTradesDay || !InSession(signalBar))
    {
       rejGovernor++;
+      return;
+   }
+   if(IsBlockedHour(signalBar))
+   {
+      rejBlockedHour++;
       return;
    }
 
@@ -499,6 +510,32 @@ void CloseAll(const string reason)
       if(pos.SelectByIndex(i) && pos.Symbol() == _Symbol && pos.Magic() == InpMagic)
          if(!trade.PositionClose(pos.Ticket(), InpSlippagePts))
             PrintFormat("Close failed (%s): retcode=%d", reason, trade.ResultRetcode());
+}
+
+//+------------------------------------------------------------------+
+//| True when the signal falls in an hour listed in InpBlockHours.     |
+//| Parsed per call rather than cached: this runs once per entry slot, |
+//| not per tick, so the cost is irrelevant next to the clarity.       |
+//+------------------------------------------------------------------+
+bool IsBlockedHour(const datetime t)
+{
+   if(StringLen(InpBlockHours) == 0)
+      return(false);
+
+   MqlDateTime st;
+   TimeToStruct(t, st);
+
+   string parts[];
+   int n = StringSplit(InpBlockHours, ',', parts);
+   for(int i = 0; i < n; i++)
+   {
+      string one = parts[i];
+      StringTrimLeft(one);
+      StringTrimRight(one);
+      if(StringLen(one) > 0 && (int)StringToInteger(one) == st.hour)
+         return(true);
+   }
+   return(false);
 }
 
 //+------------------------------------------------------------------+

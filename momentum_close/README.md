@@ -95,6 +95,26 @@ they are one directional bet counted several times, so profit factor
 flatters and drawdown understates. For deciding whether the edge is real,
 leave adds off.
 
+## Reading a backtest of this strategy
+
+The first real result (XAUUSD+, M1, Jun-Sep 2026, 1241 trades, 100% real ticks)
+returned profit factor 1.09 on a 60-minute window with a 5-minute lead. It does
+not survive inspection, and the same checks apply to any later run:
+
+- **Check what the top trade contributed.** In that run the single largest win
+  was 59% of net profit, and it was a weekend gap: the take-profit sat at
+  4224.87 and filled at 4269.54. Removing it drops profit factor to 1.04;
+  removing the top three drops it to 1.01.
+- **Check LR Correlation.** 0.47 there. A tradeable equity curve runs above
+  0.85; below that the curve is noise with a few jumps in it.
+- **Check that commission is not zero.** Spread is in the tick data but broker
+  commission is not modelled by default. At ~$6 per lot round turn it consumed
+  about 62% of that run's net profit.
+- **Check the rollover hour.** Entries in the 23:00 hour hold through the daily
+  break and over weekends. They netted close to zero while producing both the
+  largest win and the largest loss. `InpBlockHours = "23"` removes them; if net
+  profit collapses when they are gone, the gaps were the edge.
+
 ## EA notes
 
 - Attach to an **M1** chart; the window clock counts whole minutes.
