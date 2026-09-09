@@ -27,10 +27,10 @@ input int    InpEntryLeadMin   = 2;      // Enter with N minutes left
 //--- Entry
 input bool   InpUseAtrThresh   = true;   // Threshold from ATR instead of $
 input double InpMoveThreshUsd  = 2.5;    // Min move from window open ($)
-input double InpMoveAtrMult    = 1.5;    // Min move (ATR multiples)
+input double InpMoveAtrMult    = 1.0;    // Min move (ATR multiples)
 input int    InpAtrPeriod      = 14;     // ATR period
-input bool   InpRequireAlign   = true;   // Signal bar must close with the move
-input double InpMinBodyPct     = 40.0;   // Min signal-bar body (% of range)
+input bool   InpRequireAlign   = false;  // Signal bar must close with the move
+input double InpMinBodyPct     = 0.0;    // Min signal-bar body (% of range)
 input bool   InpAllowLong      = true;
 input bool   InpAllowShort     = true;
 
@@ -49,6 +49,7 @@ input double InpMinAtr         = 0.0;    // Min ATR to trade ($), 0 = off
 input double InpMaxAtr         = 0.0;    // Max ATR to trade ($), 0 = off
 input double InpMaxSpreadUsd   = 0.0;    // Max spread ($), 0 = off
 input bool   InpVerbose        = true;   // Log why entries are skipped
+input bool   InpCalibrate      = false;  // Measure moves, place no trades
 
 //--- Session (server time). Set both to 0 to trade around the clock.
 input int    InpSessionStartHr = 0;
@@ -82,6 +83,11 @@ int rejMove       = 0;   // move below threshold
 int rejLots       = 0;   // risk budget below min lot
 int entriesSent   = 0;
 
+// Calibration samples: |move| expressed in ATR multiples at each entry slot.
+double moveSamples[];
+int    sampleCount = 0;
+datetime lastFunnelDay = 0;
+
 // Daily governor
 datetime dayStamp        = 0;
 double   dayStartEquity  = 0.0;
@@ -98,7 +104,8 @@ int OnInit()
    }
    if(Period() != PERIOD_M1)
    {
-      Print("Attach to an M1 chart — the window clock counts whole minutes.");
+      PrintFormat("Attach to an M1 chart - the window clock counts whole minutes. Got %s.",
+                  EnumToString((ENUM_TIMEFRAMES)Period()));
       return(INIT_PARAMETERS_INCORRECT);
    }
 
@@ -114,6 +121,16 @@ int OnInit()
    trade.SetTypeFillingBySymbol(_Symbol);
 
    ResetDay();
+
+   // If this line is absent from the Journal, the EA never started and nothing
+   // below it ran — that is a setup problem, not a signal problem.
+   PrintFormat("MIC init OK - %s %s | window=%dm lead=%dm | thresh=%s | digits=%d point=%g",
+               _Symbol, EnumToString((ENUM_TIMEFRAMES)Period()),
+               InpWindowMin, InpEntryLeadMin,
+               InpUseAtrThresh ? StringFormat("%.2f x ATR", InpMoveAtrMult)
+                               : StringFormat("$%.2f", InpMoveThreshUsd),
+               (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS),
+               SymbolInfoDouble(_Symbol, SYMBOL_POINT));
    return(INIT_SUCCEEDED);
 }
 
@@ -122,9 +139,7 @@ void OnDeinit(const int reason)
    if(atrHandle != INVALID_HANDLE)
       IndicatorRelease(atrHandle);
 
-   PrintFormat("=== MIC funnel === entry slots:%d  sent:%d", signalBars, entriesSent);
-   PrintFormat("    rejected — move:%d body:%d governor:%d atr_band:%d atr_na:%d spread:%d win_open:%d lots:%d",
-               rejMove, rejBody, rejGovernor, rejAtrBand, rejNoAtr, rejSpread, rejNoWinOpen, rejLots);
+   PrintFunnel("final");
    if(signalBars == 0)
       Print("    No bars reached the entry slot — check that the tester has M1 history and the chart is M1.");
    else if(entriesSent == 0)
@@ -143,6 +158,16 @@ void OnTick()
    lastBarTime = barTime;
 
    RollDay();
+
+   MqlDateTime fd;
+   TimeToStruct(closedBarOrNow(), fd);
+   fd.hour = 0; fd.min = 0; fd.sec = 0;
+   if(InpVerbose && StructToTime(fd) != lastFunnelDay)
+   {
+      if(lastFunnelDay != 0)
+         PrintFunnel("daily");
+      lastFunnelDay = StructToTime(fd);
+   }
 
    datetime closedBar = iTime(_Symbol, PERIOD_M1, 1);
    if(closedBar == 0)
@@ -173,6 +198,37 @@ void OnTick()
       return;
 
    TryEnter(closedBar);
+}
+
+//+------------------------------------------------------------------+
+datetime closedBarOrNow()
+{
+   datetime t = iTime(_Symbol, PERIOD_M1, 1);
+   return(t == 0 ? TimeCurrent() : t);
+}
+
+//+------------------------------------------------------------------+
+void PrintFunnel(const string tag)
+{
+   PrintFormat("=== MIC funnel (%s) === entry slots:%d  sent:%d", tag, signalBars, entriesSent);
+   PrintFormat("    rejected - move:%d body:%d governor:%d atr_band:%d atr_na:%d spread:%d win_open:%d lots:%d",
+               rejMove, rejBody, rejGovernor, rejAtrBand, rejNoAtr, rejSpread, rejNoWinOpen, rejLots);
+
+   if(sampleCount > 0)
+   {
+      double sorted[];
+      ArrayResize(sorted, sampleCount);
+      ArrayCopy(sorted, moveSamples, 0, 0, sampleCount);
+      ArraySort(sorted);
+      PrintFormat("    |move|/ATR at entry slot over %d samples - median:%.2f  p75:%.2f  p90:%.2f  p99:%.2f  max:%.2f",
+                  sampleCount,
+                  sorted[(int)(sampleCount * 0.50)],
+                  sorted[(int)(sampleCount * 0.75)],
+                  sorted[(int)(sampleCount * 0.90)],
+                  sorted[(int)MathMin(sampleCount - 1, (int)(sampleCount * 0.99))],
+                  sorted[sampleCount - 1]);
+      Print("    Set InpMoveAtrMult near p75-p90 to trade the top quarter to tenth of moves.");
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -221,6 +277,19 @@ void TryEnter(const datetime signalBar)
 
    double move      = c - winOpen;
    double threshold = InpUseAtrThresh ? atr * InpMoveAtrMult : InpMoveThreshUsd;
+
+   // Every entry slot is sampled before any threshold is applied, so the run
+   // can report what gold actually does instead of only whether it cleared a
+   // number picked in advance.
+   if(atr > 0.0)
+   {
+      if(sampleCount >= ArraySize(moveSamples))
+         ArrayResize(moveSamples, sampleCount + 4096);
+      moveSamples[sampleCount++] = MathAbs(move) / atr;
+   }
+
+   if(InpCalibrate)
+      return;
 
    double range   = h - l;
    double bodyPct = range > 0.0 ? MathAbs(c - o) / range * 100.0 : 0.0;
