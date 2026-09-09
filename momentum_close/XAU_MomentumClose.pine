@@ -74,6 +74,11 @@ if barstate.isfirst and winMin % tfMin != 0
     runtime.error('Window length must be a whole multiple of the chart timeframe.')
 if barstate.isfirst and entryLeadMin >= winMin
     runtime.error('Entry lead must be shorter than the window.')
+// minsLeft can only take values that are multiples of the chart timeframe, so
+// a lead that is not such a multiple is silently unreachable — the single most
+// likely reason for a run that produces no trades at all.
+if barstate.isfirst and entryLeadMin % tfMin != 0
+    runtime.error('Entry lead must be a multiple of the chart timeframe. On a ' + str.tostring(tfMin) + 'm chart use a lead of ' + str.tostring(tfMin) + ', ' + str.tostring(tfMin * 2) + ', ... — a lead of ' + str.tostring(entryLeadMin) + 'm can never be reached.')
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Window clock

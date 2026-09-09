@@ -102,6 +102,11 @@ int OnInit()
       Print("Bad window settings: entry lead must be >=1 and < window length.");
       return(INIT_PARAMETERS_INCORRECT);
    }
+   if(InpWindowMin % InpEntryLeadMin == InpWindowMin)
+   {
+      Print("Entry lead is longer than the window.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
    if(Period() != PERIOD_M1)
    {
       PrintFormat("Attach to an M1 chart - the window clock counts whole minutes. Got %s.",
