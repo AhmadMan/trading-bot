@@ -758,7 +758,7 @@ void ResetDay()
 //+------------------------------------------------------------------+
 datetime PropDayStamp()
 {
-   datetime shifted = TimeCurrent() - (long)InpFtmoResetHr * 3600;
+   datetime shifted = (datetime)((long)TimeCurrent() - (long)InpFtmoResetHr * 3600);
    MqlDateTime st;
    TimeToStruct(shifted, st);
    st.hour = 0; st.min = 0; st.sec = 0;
