@@ -85,7 +85,14 @@ sessTz       = input.string('America/New_York', 'Timezone',    group='Session')
 // few positions opened just before a weekend and exited on the gap, and the
 // same mechanism produced every one of the largest losses. Blocking those
 // entries is what makes the remaining sample answer the real question.
+// The hour these are measured in is not obvious and has bitten this strategy
+// once already: Pine's bare `hour` is the EXCHANGE timezone, the chart axis
+// shows your local one, and the EA's InpBlockHours is broker server time. The
+// same string meant three different hours. blockTz makes the choice explicit -
+// set it to whatever your broker's server clock is so the backtest blocks the
+// hour the EA will actually block.
 blockHours   = input.string('23', 'Block these hours (comma separated), blank = off', group='Session')
+blockTz      = input.string('Etc/UTC', 'Timezone for the blocked hours / Friday cutoff', group='Session')
 noEntryFriHr = input.int(21,      'No entries Friday from this hour, 0 = off', minval=0, maxval=23, group='Session')
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -164,13 +171,16 @@ if dayPnlPct <= -dailyLossPct
 
 // Hour blocking. Parsed each bar rather than cached: str.split on a short
 // constant string is cheap next to keeping a var array in sync with an input.
+blockHr  = hour(time, blockTz)
+blockDow = dayofweek(time, blockTz)
+
 hourBlocked = false
 if str.length(blockHours) > 0
     for part in str.split(blockHours, ',')
-        if str.tonumber(str.trim(part)) == hour
+        if str.tonumber(str.trim(part)) == blockHr
             hourBlocked := true
 
-friBlocked = noEntryFriHr > 0 and dayofweek == dayofweek.friday and hour >= noEntryFriHr
+friBlocked = noEntryFriHr > 0 and blockDow == dayofweek.friday and blockHr >= noEntryFriHr
 timeOk     = inSession and not hourBlocked and not friBlocked
 
 canTrade = not haltedToday and tradesToday < maxTrades and timeOk and liquidityOk
