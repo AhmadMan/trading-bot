@@ -14,7 +14,7 @@
 //| something.                                                        |
 //+------------------------------------------------------------------+
 #property copyright "trading-bot"
-#property version   "1.20"
+#property version   "1.30"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -37,11 +37,39 @@ input bool   InpAllowAdds      = false;  // Take signals while already in a trad
 input int    InpMaxAdds        = 10;     // Max stacked entries per direction
 
 //--- Exit
-input bool   InpUseAtrStop     = true;   // Stop from ATR instead of $
-input double InpStopUsd        = 3.0;    // Stop distance ($)
-input double InpStopAtrMult    = 1.5;    // Stop distance (ATR mult)
-input bool   InpUseTarget      = false;  // Use profit target
+// SIGNAL puts the stop just beyond a candle instead of a fixed or ATR distance,
+// so risk is defined by the structure that produced the entry rather than by a
+// number chosen in advance.
+enum EStopMode
+{
+   STOP_USD    = 0,  // Fixed $ distance
+   STOP_ATR    = 1,  // ATR multiple
+   STOP_SIGNAL = 2   // Beyond the signal candle
+};
+
+enum EStopAnchor
+{
+   ANCHOR_SIGNAL = 0,  // The candle that fired the entry
+   ANCHOR_PREV   = 1,  // The candle before it
+   ANCHOR_BOTH   = 2   // Whichever extreme is wider
+};
+
+input EStopMode   InpStopMode   = STOP_SIGNAL;   // Stop mode
+input EStopAnchor InpStopAnchor = ANCHOR_SIGNAL; // SIGNAL stop anchored to
+input double InpStopUsd        = 3.0;    // Stop distance ($) - USD mode
+input double InpStopAtrMult    = 1.5;    // Stop distance (ATR mult) - ATR mode
+input bool   InpBufUseAtr      = false;  // SIGNAL buffer from ATR instead of $
+input double InpBufUsd         = 0.30;   // SIGNAL buffer ($)
+input double InpBufAtrMult     = 0.10;   // SIGNAL buffer (ATR mult)
+// Position size is risk / stop distance, so a doji signal candle implies a
+// near-zero stop and a size limited only by the broker. Reject those.
+input double InpMinStopUsd     = 0.80;   // Reject signal if stop is tighter than ($)
+input bool   InpUseTarget      = true;   // Use profit target
 input double InpTargetR        = 1.0;    // Target (R multiples)
+// The window close was the original premise, but it cuts the trade within a few
+// bars - so any target above roughly 1R could never be reached with it on, and
+// every InpTargetR produced the same result. Off means stop and target decide.
+input bool   InpFlatAtWinClose = false;  // Flatten at the window boundary
 
 //--- Sizing
 // Fixed lots make every trade the same size, so the backtest is a clean sample
@@ -54,7 +82,7 @@ input double InpMaxLots        = 0.0;    // Hard lot cap, 0 = broker maximum
 //--- Risk
 input double InpRiskPct        = 0.3;    // Risk per trade (% equity)
 input int    InpMaxTradesDay   = 100;    // Max trades per day (adds count)
-input double InpDailyLossPct   = 2.5;    // Daily loss stop (% equity)
+input double InpDailyLossPct   = 0.0;    // Daily loss stop (% equity), 0 = off
 input double InpMinAtr         = 0.0;    // Min ATR to trade ($), 0 = off
 input double InpMaxAtr         = 0.0;    // Max ATR to trade ($), 0 = off
 input double InpMaxSpreadUsd   = 0.0;    // Max spread ($), 0 = off
@@ -121,6 +149,7 @@ int rejMove       = 0;   // move below threshold
 int rejLots       = 0;   // risk budget below min lot
 int rejOpposite   = 0;   // opposite signal while in a position
 int rejMaxAdds    = 0;   // add limit reached
+int rejStopTight  = 0;   // signal candle implies a stop too tight to trade
 int rejBlockedHour= 0;   // hour listed in InpBlockHours
 int addCount      = 0;   // stacked entries in the current position
 int entriesSent   = 0;
@@ -216,13 +245,24 @@ int OnInit()
 
    // If this line is absent from the Journal, the EA never started and nothing
    // below it ran — that is a setup problem, not a signal problem.
-   PrintFormat("MIC init OK - %s %s | window=%dm lead=%dm | sizing=%s | thresh=%s | digits=%d point=%g",
+   PrintFormat("MIC init OK - %s %s | window=%dm lead=%dm | sizing=%s | thresh=%s | stop=%s | target=%s | flat_at_close=%s | digits=%d point=%g",
                _Symbol, EnumToString((ENUM_TIMEFRAMES)Period()),
                InpWindowMin, InpEntryLeadMin,
                InpUseFixedLot ? StringFormat("fixed %.2f lots", InpFixedLots)
                               : StringFormat("%.2f%% risk", InpRiskPct),
                InpUseAtrThresh ? StringFormat("%.2f x ATR", InpMoveAtrMult)
                                : StringFormat("$%.2f", InpMoveThreshUsd),
+               InpStopMode == STOP_SIGNAL
+                  ? StringFormat("signal candle (%s) +%.2f %s buffer",
+                       InpStopAnchor == ANCHOR_PREV ? "previous"
+                     : InpStopAnchor == ANCHOR_BOTH ? "both" : "signal",
+                       InpBufUseAtr ? InpBufAtrMult : InpBufUsd,
+                       InpBufUseAtr ? "xATR" : "USD")
+                  : InpStopMode == STOP_ATR
+                     ? StringFormat("%.2f x ATR", InpStopAtrMult)
+                     : StringFormat("$%.2f", InpStopUsd),
+               InpUseTarget ? StringFormat("%.2f R", InpTargetR) : "off",
+               InpFlatAtWinClose ? "yes" : "no",
                (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS),
                SymbolInfoDouble(_Symbol, SYMBOL_POINT));
    return(INIT_SUCCEEDED);
@@ -287,9 +327,13 @@ void OnTick()
 
    if(minsLeft == 0)
    {
-      CloseAll("window close");
+      if(InpFlatAtWinClose)
+      {
+         CloseAll("window close");
+         addCount = 0;
+         return;
+      }
       addCount = 0;
-      return;
    }
 
    if(!HasPosition())
@@ -317,8 +361,8 @@ void PrintFunnel(const string tag)
    PrintFormat("=== MIC funnel (%s) === entry slots:%d  sent:%d", tag, signalBars, entriesSent);
    PrintFormat("    rejected - move:%d body:%d governor:%d atr_band:%d atr_na:%d spread:%d win_open:%d lots:%d",
                rejMove, rejBody, rejGovernor, rejAtrBand, rejNoAtr, rejSpread, rejNoWinOpen, rejLots);
-   PrintFormat("    rejected - opposite_signal:%d max_adds:%d blocked_hour:%d",
-               rejOpposite, rejMaxAdds, rejBlockedHour);
+   PrintFormat("    rejected - opposite_signal:%d max_adds:%d blocked_hour:%d stop_too_tight:%d",
+               rejOpposite, rejMaxAdds, rejBlockedHour, rejStopTight);
 
    if(sampleCount > 0)
    {
@@ -443,9 +487,72 @@ void TryEnter(const datetime signalBar)
       }
    }
 
-   double stopDist = InpUseAtrStop ? atr * InpStopAtrMult : InpStopUsd;
-   if(stopDist <= 0.0)
-      return;
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int    dg  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   // The stop as a PRICE. In SIGNAL mode it is fixed by the candle, so the
+   // distance follows from where we actually fill rather than the other way
+   // round - which is what makes InpTargetR a true ratio on realised risk.
+   double slPrice = 0.0;
+   double stopDist = 0.0;
+
+   if(InpStopMode == STOP_SIGNAL)
+   {
+      double buf = InpBufUseAtr ? atr * InpBufAtrMult : InpBufUsd;
+
+      // Bar 1 is the signal candle, bar 2 the one before it.
+      double pH = iHigh(_Symbol, Period(), 2);
+      double pL = iLow (_Symbol, Period(), 2);
+
+      // iHigh/iLow return 0 when the bar is not available, and a zero anchor
+      // would put the stop at price 0 and size the position off the full price
+      // of gold. Stand down instead.
+      if(InpStopAnchor != ANCHOR_SIGNAL && (pH <= 0.0 || pL <= 0.0))
+      {
+         rejNoWinOpen++;
+         if(InpVerbose)
+            Print("skip: previous candle unavailable for the stop anchor");
+         return;
+      }
+
+      double anchLow  = l;
+      double anchHigh = h;
+      if(InpStopAnchor == ANCHOR_PREV)
+      {
+         anchLow  = pL;
+         anchHigh = pH;
+      }
+      else if(InpStopAnchor == ANCHOR_BOTH)
+      {
+         anchLow  = MathMin(l, pL);
+         anchHigh = MathMax(h, pH);
+      }
+
+      slPrice  = goLong ? anchLow - buf : anchHigh + buf;
+      stopDist = goLong ? ask - slPrice : slPrice - bid;
+
+      // A stop tighter than the spread is a coin flip with leverage, and the
+      // PREV anchor can land the stop on the wrong side of the entry entirely
+      // (a fast move leaves the prior candle's low above the current ask), which
+      // the <= 0 case catches.
+      if(stopDist <= 0.0 || stopDist < InpMinStopUsd)
+      {
+         rejStopTight++;
+         if(InpVerbose)
+            PrintFormat("skip @%s stop too tight: dist=%.2f min=%.2f anchor=%.2f",
+                        TimeToString(signalBar, TIME_MINUTES), stopDist,
+                        InpMinStopUsd, slPrice);
+         return;
+      }
+   }
+   else
+   {
+      stopDist = (InpStopMode == STOP_ATR) ? atr * InpStopAtrMult : InpStopUsd;
+      if(stopDist <= 0.0)
+         return;
+      slPrice = goLong ? ask - stopDist : bid + stopDist;
+   }
 
    double lots = LotsForRisk(stopDist);
    if(lots <= 0.0)
@@ -454,20 +561,16 @@ void TryEnter(const datetime signalBar)
       return;
    }
 
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   int    dg  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-
    bool ok = false;
    if(goLong)
    {
-      double sl = NormalizeDouble(ask - stopDist, dg);
+      double sl = NormalizeDouble(slPrice, dg);
       double tp = InpUseTarget ? NormalizeDouble(ask + stopDist * InpTargetR, dg) : 0.0;
       ok = trade.Buy(lots, _Symbol, 0.0, sl, tp, "MIC long");
    }
    else
    {
-      double sl = NormalizeDouble(bid + stopDist, dg);
+      double sl = NormalizeDouble(slPrice, dg);
       double tp = InpUseTarget ? NormalizeDouble(bid - stopDist * InpTargetR, dg) : 0.0;
       ok = trade.Sell(lots, _Symbol, 0.0, sl, tp, "MIC short");
    }
@@ -479,7 +582,7 @@ void TryEnter(const datetime signalBar)
       addCount++;
       // A netted position has one average price and one stop, so every add
       // moves the stop; without this the bracket still refers to the first fill.
-      ResetStopFromAverage(stopDist);
+      ApplyBracket(slPrice, stopDist);
    }
    else
       PrintFormat("Order rejected: retcode=%d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
@@ -555,7 +658,7 @@ int PositionDir()
 }
 
 //+------------------------------------------------------------------+
-void ResetStopFromAverage(const double stopDist)
+void ApplyBracket(const double slPrice, const double stopDist)
 {
    int dg = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -565,10 +668,21 @@ void ResetStopFromAverage(const double stopDist)
 
       bool   isLong = pos.PositionType() == POSITION_TYPE_BUY;
       double avg    = pos.PriceOpen();
-      double sl     = NormalizeDouble(isLong ? avg - stopDist : avg + stopDist, dg);
-      double tp     = InpUseTarget
-                    ? NormalizeDouble(isLong ? avg + stopDist * InpTargetR : avg - stopDist * InpTargetR, dg)
-                    : 0.0;
+
+      // SIGNAL mode keeps the candle-anchored price; the other modes keep their
+      // distance from the netted average, which is what an add re-anchors.
+      double sl = NormalizeDouble(
+                     InpStopMode == STOP_SIGNAL ? slPrice
+                                                : (isLong ? avg - stopDist : avg + stopDist), dg);
+
+      // Risk measured from the position's actual average, so InpTargetR is a
+      // true ratio on realised risk rather than on the distance estimated
+      // before the fill. After an add the average has moved, so both levels
+      // move with it.
+      double risk = MathAbs(avg - sl);
+      double tp   = InpUseTarget
+                  ? NormalizeDouble(isLong ? avg + risk * InpTargetR : avg - risk * InpTargetR, dg)
+                  : 0.0;
 
       if(MathAbs(pos.StopLoss() - sl) > SymbolInfoDouble(_Symbol, SYMBOL_POINT))
          if(!trade.PositionModify(pos.Ticket(), sl, tp))
@@ -773,7 +887,9 @@ void RollDay()
       return;
    }
 
-   if(dayStartEquity > 0.0 && !haltedToday)
+   // 0 disables the governor entirely. Without this guard a threshold of 0 halts
+   // the moment the day is a cent down, which silently empties the run.
+   if(InpDailyLossPct > 0.0 && dayStartEquity > 0.0 && !haltedToday)
    {
       double pnlPct = (AccountInfoDouble(ACCOUNT_EQUITY) - dayStartEquity) / dayStartEquity * 100.0;
       if(pnlPct <= -InpDailyLossPct)

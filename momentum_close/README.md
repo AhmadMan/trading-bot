@@ -258,3 +258,27 @@ they produce completely different trade populations from the same signals.
 The live stop and target are plotted while a position is open, so the levels the
 strategy is actually working can be read off the chart rather than inferred from
 the trade list.
+
+### The EA matches (v1.30)
+
+`InpStopMode` = `STOP_SIGNAL` / `STOP_ATR` / `STOP_USD`, with `InpStopAnchor` =
+`ANCHOR_SIGNAL` / `ANCHOR_PREV` / `ANCHOR_BOTH`, `InpBufUsd` / `InpBufAtrMult`,
+`InpMinStopUsd`, and `InpFlatAtWinClose` (off) — the same logic and the same
+defaults as the Pine version, so the backtest and the EA describe one strategy.
+
+Two differences are deliberate, because MT5 knows things Pine does not:
+
+- **The EA measures risk from the real fill price.** The stop price comes from
+  the candle; `stopDist` is then `ask - slPrice`, the actual distance being
+  risked. Pine has to estimate it from the signal bar's close because the fill
+  is a bar later. So `InpTargetR = 2` is exactly 2R in MT5 and approximately 2R
+  in Pine — expect small differences in the trade list, not in the conclusion.
+- **`ApplyBracket` re-derives both levels from the netted average** after every
+  add, so with `InpAllowAdds` on the stop and target move together as the
+  average shifts. SIGNAL mode keeps the candle-anchored price; the other modes
+  keep their distance from the average.
+
+`rejStopTight` joins the funnel line as `stop_too_tight`. With `ANCHOR_PREV`
+that count also absorbs signals where the previous candle sits on the wrong side
+of the entry, and signals where bar 2 is not yet available — both would
+otherwise produce a stop at a nonsensical price.
