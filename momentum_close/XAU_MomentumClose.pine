@@ -1,0 +1,382 @@
+//@version=6
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// XAU Momentum-Into-Close — backtest harness
+//
+// Port of the "5-minute BTC Up/Down momentum-into-close" idea to spot gold.
+// Polymarket resolves a binary at a fixed clock boundary; spot gold has no
+// expiry, so the boundary is synthesised: the clock is cut into fixed windows
+// (default 5 minutes, anchored to the epoch so they line up with :00/:05/...),
+// and every window is treated as its own "market" that closes on its last bar.
+//
+// Sequence inside one window:
+//   1. Window opens, price is recorded.
+//   2. With `entryLeadMin` minutes left, measure the move from the window open.
+//   3. If the move exceeds `moveThresh` AND the momentum filter agrees,
+//      enter in the direction of the move.
+//   4. Flatten on the final bar of the window. Stop/target are protective only.
+//
+// The point of this file is to answer one question before any money or any EA
+// exists: does late-window momentum in gold continue or revert? Run it, look
+// at the profit factor and the trade count, and treat a result that is not
+// clearly positive across several years and several parameter values as a NO.
+
+strategy('XAU Momentum Into Close', shorttitle='XAU_MIC', overlay=true,
+     calc_on_every_tick=false,
+     initial_capital=10000,
+     default_qty_type=strategy.fixed,
+     pyramiding=10,
+     currency=currency.USD,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.0,
+     slippage=0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────────────────────────────────────
+winMin       = input.int(5,    'Window length (minutes)',    minval=2, maxval=240, group='Window')
+entryLeadMin = input.int(2,    'Enter with N minutes left',  minval=1, maxval=60,  group='Window')
+
+moveMode     = input.string('ATR', 'Move threshold mode', options=['USD', 'ATR'], group='Entry')
+moveThresh   = input.float(2.5,  'Min move from window open ($)', minval=0.0, step=0.1, group='Entry')
+moveAtrMult  = input.float(1.5,  'Min move (ATR multiples)',      minval=0.0, step=0.1, group='Entry')
+atrLen       = input.int(14,     'ATR length',                    minval=1,            group='Entry')
+requireAlign = input.bool(true,  'Signal bar must close with the move', group='Entry')
+minBodyPct   = input.float(40.0, 'Min signal-bar body (% of range)', minval=0, maxval=100, step=5, group='Entry')
+allowLong    = input.bool(true,  'Allow longs',  group='Entry')
+allowShort   = input.bool(true,  'Allow shorts', group='Entry')
+// Off by default the strategy holds one trade at a time, so a signal arriving
+// mid-trade is skipped. Turning this on takes every signal instead, which is
+// what makes the fill count match the arrow count.
+allowAdds    = input.bool(false, 'Take signals while already in a trade', group='Entry')
+
+// SIGNAL mode puts the stop just beyond the signal candle rather than a fixed
+// or ATR distance, so risk is defined by the structure that produced the entry.
+// The distance it yields varies trade to trade, which is the point - and is
+// also why minStopUsd exists: a doji signal candle would otherwise imply a
+// near-zero stop and a position size large enough to blow the account.
+stopMode     = input.string('SIGNAL', 'Stop mode', options=['USD', 'ATR', 'SIGNAL'], group='Exit')
+stopUsd      = input.float(3.0,  'Stop distance ($)',          minval=0.1, step=0.1, group='Exit')
+stopAtrMult  = input.float(1.5,  'Stop distance (ATR mult)',   minval=0.1, step=0.1, group='Exit')
+// Which candle the stop hides behind. "Signal" is the bar that fired the entry;
+// "Previous" is the one before it, which on a strong signal bar sits further
+// away and is not itself part of the move being traded; "Both" takes whichever
+// extreme is wider, so the stop clears either candle.
+stopAnchor   = input.string('Signal', 'SIGNAL stop anchored to',
+   options=['Signal', 'Previous', 'Both'], group='Exit')
+bufMode      = input.string('USD', 'SIGNAL buffer mode', options=['USD', 'ATR'], group='Exit')
+bufUsd       = input.float(0.30, 'SIGNAL buffer ($)',          minval=0.0, step=0.05, group='Exit')
+bufAtrMult   = input.float(0.10, 'SIGNAL buffer (ATR mult)',   minval=0.0, step=0.05, group='Exit')
+minStopUsd   = input.float(0.80, 'Reject signal if stop is tighter than ($)', minval=0.0, step=0.1, group='Exit')
+useTarget    = input.bool(true,  'Use profit target',          group='Exit')
+targetR      = input.float(1.0,  'Target (R multiples)',       minval=0.1, step=0.1, group='Exit')
+
+// OFF by default now. The window close was the original premise - the edge lives
+// in the final minutes and does not survive being held - but it makes testing a
+// reward:risk ratio impossible: the boundary arrives within a few bars and cuts
+// the trade long before a 2R or 3R target could be touched, so every targetR
+// above about 1 produced the same result. Turn it back on only to test the
+// original momentum-into-close idea, not an RR strategy.
+flatAtWinClose = input.bool(false, 'Flatten at window close', group='Exit')
+
+riskPct      = input.float(0.3,  'Risk per trade (% equity)',  minval=0.01, maxval=5.0, step=0.05, group='Risk')
+maxTrades    = input.int(20,     'Max trades per day',         minval=1,            group='Risk')
+dailyLossPct = input.float(0.0,  'Daily loss stop (% equity), 0 = off', minval=0.0, step=0.5, group='Risk')
+minAtr       = input.float(0.0,  'Min ATR to trade ($), 0=off', minval=0.0, step=0.1, group='Risk')
+maxAtr       = input.float(0.0,  'Max ATR to trade ($), 0=off', minval=0.0, step=0.5, group='Risk')
+
+useSession   = input.bool(false, 'Restrict to a session',      group='Session')
+sessStr      = input.session('0800-1700', 'Session',           group='Session')
+sessTz       = input.string('America/New_York', 'Timezone',    group='Session')
+
+// Gap protection. Both MT5 backtests owed nearly all of their net profit to a
+// few positions opened just before a weekend and exited on the gap, and the
+// same mechanism produced every one of the largest losses. Blocking those
+// entries is what makes the remaining sample answer the real question.
+// The hour these are measured in is not obvious and has bitten this strategy
+// once already: Pine's bare `hour` is the EXCHANGE timezone, the chart axis
+// shows your local one, and the EA's InpBlockHours is broker server time. The
+// same string meant three different hours. blockTz makes the choice explicit -
+// set it to whatever your broker's server clock is so the backtest blocks the
+// hour the EA will actually block.
+blockHours   = input.string('23', 'Block these hours (comma separated), blank = off', group='Session')
+blockTz      = input.string('Etc/UTC', 'Timezone for the blocked hours / Friday cutoff', group='Session')
+noEntryFriHr = input.int(21,      'No entries Friday from this hour, 0 = off', minval=0, maxval=23, group='Session')
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Guards
+// ─────────────────────────────────────────────────────────────────────────────
+tfSec = timeframe.in_seconds(timeframe.period)
+if barstate.isfirst
+    if tfSec < 60 or tfSec > 3600 or tfSec % 60 != 0
+        runtime.error('Use a whole-minute intraday chart (1m recommended).')
+
+tfMin = int(math.round(tfSec / 60))
+if barstate.isfirst and winMin % tfMin != 0
+    runtime.error('Window length must be a whole multiple of the chart timeframe.')
+if barstate.isfirst and entryLeadMin >= winMin
+    runtime.error('Entry lead must be shorter than the window.')
+// minsLeft can only take values that are multiples of the chart timeframe, so
+// a lead that is not such a multiple is silently unreachable — the single most
+// likely reason for a run that produces no trades at all.
+if barstate.isfirst and entryLeadMin % tfMin != 0
+    runtime.error('Entry lead must be a multiple of the chart timeframe. On a ' + str.tostring(tfMin) + 'm chart use a lead of ' + str.tostring(tfMin) + ', ' + str.tostring(tfMin * 2) + ', ... — a lead of ' + str.tostring(entryLeadMin) + 'm can never be reached.')
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Window clock
+// ─────────────────────────────────────────────────────────────────────────────
+// `time` is the bar's opening timestamp in UTC ms, so flooring it by the window
+// length anchors every window to the wall clock regardless of the symbol's
+// session — the same boundary an expiring 5-minute market would use.
+winMs      = winMin * 60000
+winId      = math.floor(time / winMs)
+newWindow  = winId != nz(winId[1], winId)
+msIntoWin  = time % winMs
+minsLeft   = winMin - int(msIntoWin / 60000) - tfMin   // full minutes after this bar closes
+
+isEntryBar = minsLeft == entryLeadMin
+isLastBar  = minsLeft == 0
+
+var float winOpen = na
+if newWindow
+    winOpen := open
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signal
+// ─────────────────────────────────────────────────────────────────────────────
+atr      = ta.atr(atrLen)
+move     = close - winOpen
+threshold = moveMode == 'ATR' ? atr * moveAtrMult : moveThresh
+
+barRange = high - low
+bodyPct  = barRange > 0 ? math.abs(close - open) / barRange * 100 : 0.0
+barUp    = close > open
+barDown  = close < open
+
+alignedUp   = not requireAlign or barUp
+alignedDown = not requireAlign or barDown
+bodyOk      = bodyPct >= minBodyPct
+
+inSession = not useSession or not na(time(timeframe.period, sessStr, sessTz))
+liquidityOk = not na(atr) and (minAtr <= 0 or atr >= minAtr) and (maxAtr <= 0 or atr <= maxAtr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Daily risk governor
+// ─────────────────────────────────────────────────────────────────────────────
+newDay = ta.change(time('D')) != 0
+var float dayStartEquity = strategy.equity
+var int   tradesToday    = 0
+var bool  haltedToday    = false
+
+if newDay
+    dayStartEquity := strategy.equity
+    tradesToday    := 0
+    haltedToday    := false
+
+dayPnlPct = dayStartEquity > 0 ? (strategy.equity - dayStartEquity) / dayStartEquity * 100 : 0.0
+// 0 disables the governor entirely: without this guard a threshold of 0 halts
+// the moment the day is a cent down, which silently empties the backtest.
+if dailyLossPct > 0 and dayPnlPct <= -dailyLossPct
+    haltedToday := true
+
+// Hour blocking. Parsed each bar rather than cached: str.split on a short
+// constant string is cheap next to keeping a var array in sync with an input.
+blockHr  = hour(time, blockTz)
+blockDow = dayofweek(time, blockTz)
+
+hourBlocked = false
+if str.length(blockHours) > 0
+    for part in str.split(blockHours, ',')
+        if str.tonumber(str.trim(part)) == blockHr
+            hourBlocked := true
+
+friBlocked = noEntryFriHr > 0 and blockDow == dayofweek.friday and blockHr >= noEntryFriHr
+timeOk     = inSession and not hourBlocked and not friBlocked
+
+canTrade = not haltedToday and tradesToday < maxTrades and timeOk and liquidityOk
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signals
+// ─────────────────────────────────────────────────────────────────────────────
+// Defined before sizing because in SIGNAL mode the stop distance depends on the
+// direction: the stop sits under the signal candle for a long, over it for a short.
+longSignal0  = allowLong  and isEntryBar and move >=  threshold and alignedUp   and bodyOk
+shortSignal0 = allowShort and isEntryBar and move <= -threshold and alignedDown and bodyOk
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sizing
+// ─────────────────────────────────────────────────────────────────────────────
+// Stop distance is in dollars per ounce, so risk / stop gives size in ounces —
+// divide by 100 for standard lots when this is carried over to the EA.
+buf      = bufMode == 'ATR' ? atr * bufAtrMult : bufUsd
+
+// The stop PRICES, defined once and used for both sizing and the live bracket
+// so the two can never disagree. [1] is the candle before the signal candle.
+anchLow  = stopAnchor == 'Previous' ? low[1]  : stopAnchor == 'Both' ? math.min(low,  low[1])  : low
+anchHigh = stopAnchor == 'Previous' ? high[1] : stopAnchor == 'Both' ? math.max(high, high[1]) : high
+
+slLongPx  = anchLow  - buf
+slShortPx = anchHigh + buf
+
+// Distance measured from the signal candle's close - the price the decision was
+// made at. The real fill is the next bar's open, so the stop PRICE is what stays
+// fixed and the target is recomputed from the actual average fill; that keeps
+// the ratio honest rather than the distance.
+sigStopLong  = close - slLongPx
+sigStopShort = slShortPx - close
+
+stopDistFixed = stopMode == 'ATR' ? atr * stopAtrMult : stopUsd
+stopDist = stopMode != 'SIGNAL' ? stopDistFixed :
+   longSignal0 ? sigStopLong : shortSignal0 ? sigStopShort : stopDistFixed
+
+// A stop tighter than the spread plus a tick is not a stop, it is a coin flip
+// with leverage. Reject the signal instead of trading a distance that would
+// size the position into the stratosphere.
+//
+// The > 0 test also catches the anchor landing on the WRONG SIDE of the entry,
+// which the 'Previous' anchor makes possible: on a fast move the prior candle's
+// low can sit above the signal close, so a long would have its stop above its
+// entry. Those signals are dropped and counted as "stop too tight".
+stopOk = stopMode != 'SIGNAL' or (stopDist >= minStopUsd and stopDist > 0)
+
+longSignal  = longSignal0  and stopOk
+shortSignal = shortSignal0 and stopOk
+
+riskAmt  = strategy.equity * riskPct / 100
+qty      = stopDist > 0 ? riskAmt / stopDist : 0.0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Orders
+// ─────────────────────────────────────────────────────────────────────────────
+anySignal   = longSignal or shortSignal
+
+// A signal is not a trade. Each reason one is dropped is counted so the gap
+// between plotted arrows and filled orders is visible rather than guessed at.
+var int nSignals   = 0
+var int nInPos     = 0
+var int nHalted    = 0
+var int nMaxTrades = 0
+var int nNoLiquid  = 0
+var int nOutSess   = 0
+var int nTightStop = 0
+var int nFilled    = 0
+
+// Counted off the raw signal so a stop rejection is visible rather than simply
+// absent from the tally.
+if (longSignal0 or shortSignal0) and not stopOk
+    nTightStop += 1
+
+if anySignal
+    nSignals += 1
+    if strategy.position_size != 0 and not allowAdds
+        nInPos += 1
+    else if haltedToday
+        nHalted += 1
+    else if tradesToday >= maxTrades
+        nMaxTrades += 1
+    else if not liquidityOk
+        nNoLiquid += 1
+    else if not timeOk
+        nOutSess += 1
+    else if qty > 0
+        nFilled += 1
+
+// Each add needs its own order ID. Reusing one ID modifies the existing entry
+// instead of stacking a new one, so with allowAdds on the later signals would
+// silently fail to build a position.
+var int entrySeq = 0
+
+// In SIGNAL mode the stop is a PRICE fixed by the signal candle, not a distance
+// from the fill, so it is captured here and held until the position closes.
+// An add re-anchors it to the newer candle, matching how the EA re-anchors the
+// netted position's single stop.
+var float anchorStop = na
+
+if canTrade and qty > 0 and (allowAdds or strategy.position_size == 0)
+    if longSignal
+        entrySeq += 1
+        anchorStop := slLongPx
+        strategy.entry('L' + str.tostring(entrySeq), strategy.long, qty=qty)
+        tradesToday += 1
+    else if shortSignal
+        entrySeq += 1
+        anchorStop := slShortPx
+        strategy.entry('S' + str.tostring(entrySeq), strategy.short, qty=qty)
+        tradesToday += 1
+
+// Protective bracket, evaluated intrabar: strategy.exit fills the moment price
+// touches either level, which is the "close on the touch" behaviour.
+// Held for plotting, so the levels the strategy is actually working can be read
+// off the chart instead of inferred from the trade list.
+var float liveStop = na
+var float liveTgt  = na
+
+if strategy.position_size != 0
+    entryPx = strategy.position_avg_price
+    isLong  = strategy.position_size > 0
+
+    // The stop price: the signal candle's extreme in SIGNAL mode, otherwise the
+    // fixed distance measured from the actual fill.
+    sl = stopMode == 'SIGNAL' and not na(anchorStop) ? anchorStop :
+       isLong ? entryPx - stopDist : entryPx + stopDist
+
+    // Risk measured from where the trade actually filled, so targetR = 1 is a
+    // true 1:1 on realised risk rather than on the distance we estimated at
+    // signal time. Those differ by the gap between signal close and fill.
+    riskPx = math.abs(entryPx - sl)
+    tp = useTarget ? (isLong ? entryPx + riskPx * targetR : entryPx - riskPx * targetR) : na
+
+    liveStop := sl
+    liveTgt  := tp
+
+    // No from_entry: with unique per-add IDs the stop has to cover every open
+    // entry, not just one of them.
+    strategy.exit('X', stop=sl, limit=tp)
+
+// Flat at the window boundary. Optional now: with a 1:1 target the trade needs
+// room to reach it, and flattening at the boundary cuts most trades before
+// either level is touched.
+if flatAtWinClose and isLastBar and strategy.position_size != 0
+    strategy.close_all(comment='window close')
+
+if strategy.position_size == 0
+    anchorStop := na
+    liveStop   := na
+    liveTgt    := na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Visuals
+// ─────────────────────────────────────────────────────────────────────────────
+plot(liveStop, 'Stop',   color=color.new(color.red,  0), style=plot.style_linebr, linewidth=2)
+plot(liveTgt,  'Target', color=color.new(color.teal, 0), style=plot.style_linebr, linewidth=2)
+
+plot(winOpen, 'Window open', color=color.new(color.gray, 40), style=plot.style_stepline)
+bgcolor(isEntryBar ? color.new(color.blue, 90) : na, title='Entry bar')
+bgcolor(haltedToday ? color.new(color.red, 92) : na, title='Halted')
+// Arrows now show every signal. Solid = taken, hollow = dropped, so a chart
+// full of hollow arrows points straight at the reason in the table.
+taken = anySignal and canTrade and qty > 0 and (allowAdds or strategy.position_size == 0)
+plotshape(longSignal  and taken,       'Long taken',    shape.triangleup,   location.belowbar, color.new(color.teal, 0),  size=size.tiny)
+plotshape(shortSignal and taken,       'Short taken',   shape.triangledown, location.abovebar, color.new(color.red, 0),   size=size.tiny)
+plotshape(longSignal  and not taken,   'Long dropped',  shape.triangleup,   location.belowbar, color.new(color.teal, 65), size=size.tiny)
+plotshape(shortSignal and not taken,   'Short dropped', shape.triangledown, location.abovebar, color.new(color.red, 65),  size=size.tiny)
+
+showTable = input.bool(true, 'Show signal funnel', group='Display')
+if showTable and barstate.islastconfirmedhistory
+    t = table.new(position.top_right, 2, 8, border_width=1)
+    table.cell(t, 0, 0, 'signals',        text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 0, str.tostring(nSignals),   text_color=color.gray, text_size=size.small)
+    table.cell(t, 0, 1, 'taken',          text_color=color.teal, text_size=size.small)
+    table.cell(t, 1, 1, str.tostring(nFilled),    text_color=color.teal, text_size=size.small)
+    table.cell(t, 0, 2, 'in a position',  text_color=color.orange, text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(nInPos),     text_color=color.orange, text_size=size.small)
+    table.cell(t, 0, 3, 'daily loss halt', text_color=color.red, text_size=size.small)
+    table.cell(t, 1, 3, str.tostring(nHalted),    text_color=color.red, text_size=size.small)
+    table.cell(t, 0, 4, 'max trades/day', text_color=color.red, text_size=size.small)
+    table.cell(t, 1, 4, str.tostring(nMaxTrades), text_color=color.red, text_size=size.small)
+    table.cell(t, 0, 5, 'ATR band',       text_color=color.red, text_size=size.small)
+    table.cell(t, 1, 5, str.tostring(nNoLiquid),  text_color=color.red, text_size=size.small)
+    table.cell(t, 0, 6, 'session/hour block', text_color=color.red, text_size=size.small)
+    table.cell(t, 1, 6, str.tostring(nOutSess),   text_color=color.red, text_size=size.small)
+    table.cell(t, 0, 7, 'stop too tight', text_color=color.red, text_size=size.small)
+    table.cell(t, 1, 7, str.tostring(nTightStop), text_color=color.red, text_size=size.small)
