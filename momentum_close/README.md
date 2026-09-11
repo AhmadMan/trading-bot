@@ -210,9 +210,20 @@ in the same account is invisible to it and still counts against your limits.
 
 ## Signal-candle stop with 1:1 target
 
-`stopMode = 'SIGNAL'` places the stop just beyond the signal candle instead of a
-fixed or ATR distance: under the candle's low for a long, over its high for a
-short, plus `bufUsd` (default $0.30) or `bufAtrMult`. `useTarget` defaults on
+`stopMode = 'SIGNAL'` places the stop just beyond a candle instead of a fixed or
+ATR distance: under its low for a long, over its high for a short, plus `bufUsd`
+(default $0.30) or `bufAtrMult`. `stopAnchor` chooses which candle:
+
+- **Signal** (default) — the bar that fired the entry.
+- **Previous** — the bar before it. On a strong signal bar this usually sits
+  further away, and it is not itself part of the move being traded.
+- **Both** — whichever extreme is wider, so the stop clears either candle.
+
+`Previous` can put the stop on the *wrong side* of the entry: in a fast move the
+prior candle's low can sit above the signal close, which would mean a long with
+its stop above its entry. Those signals are rejected, not traded, and land in the
+funnel's "stop too tight" row — so expect that count to rise when you switch
+anchors, and read it rather than assuming signals went missing. `useTarget` defaults on
 with `targetR = 1.0`, so the target sits the same distance the other side of the
 fill. `strategy.exit` fills the instant either level trades, which is the
 close-on-touch behaviour.

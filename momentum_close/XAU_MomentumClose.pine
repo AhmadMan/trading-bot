@@ -58,6 +58,12 @@ allowAdds    = input.bool(false, 'Take signals while already in a trade', group=
 stopMode     = input.string('SIGNAL', 'Stop mode', options=['USD', 'ATR', 'SIGNAL'], group='Exit')
 stopUsd      = input.float(3.0,  'Stop distance ($)',          minval=0.1, step=0.1, group='Exit')
 stopAtrMult  = input.float(1.5,  'Stop distance (ATR mult)',   minval=0.1, step=0.1, group='Exit')
+// Which candle the stop hides behind. "Signal" is the bar that fired the entry;
+// "Previous" is the one before it, which on a strong signal bar sits further
+// away and is not itself part of the move being traded; "Both" takes whichever
+// extreme is wider, so the stop clears either candle.
+stopAnchor   = input.string('Signal', 'SIGNAL stop anchored to',
+   options=['Signal', 'Previous', 'Both'], group='Exit')
 bufMode      = input.string('USD', 'SIGNAL buffer mode', options=['USD', 'ATR'], group='Exit')
 bufUsd       = input.float(0.30, 'SIGNAL buffer ($)',          minval=0.0, step=0.05, group='Exit')
 bufAtrMult   = input.float(0.10, 'SIGNAL buffer (ATR mult)',   minval=0.0, step=0.05, group='Exit')
@@ -200,12 +206,20 @@ shortSignal0 = allowShort and isEntryBar and move <= -threshold and alignedDown 
 // divide by 100 for standard lots when this is carried over to the EA.
 buf      = bufMode == 'ATR' ? atr * bufAtrMult : bufUsd
 
-// Anchored to the signal candle's own extreme, measured from its close (the
-// price the decision was made at). The real fill is the next bar's open, so the
-// stop price below is what stays fixed and the target is recomputed from the
-// actual average fill - that keeps the ratio honest rather than the distance.
-sigStopLong  = close - (low  - buf)
-sigStopShort = (high + buf) - close
+// The stop PRICES, defined once and used for both sizing and the live bracket
+// so the two can never disagree. [1] is the candle before the signal candle.
+anchLow  = stopAnchor == 'Previous' ? low[1]  : stopAnchor == 'Both' ? math.min(low,  low[1])  : low
+anchHigh = stopAnchor == 'Previous' ? high[1] : stopAnchor == 'Both' ? math.max(high, high[1]) : high
+
+slLongPx  = anchLow  - buf
+slShortPx = anchHigh + buf
+
+// Distance measured from the signal candle's close - the price the decision was
+// made at. The real fill is the next bar's open, so the stop PRICE is what stays
+// fixed and the target is recomputed from the actual average fill; that keeps
+// the ratio honest rather than the distance.
+sigStopLong  = close - slLongPx
+sigStopShort = slShortPx - close
 
 stopDistFixed = stopMode == 'ATR' ? atr * stopAtrMult : stopUsd
 stopDist = stopMode != 'SIGNAL' ? stopDistFixed :
@@ -214,6 +228,11 @@ stopDist = stopMode != 'SIGNAL' ? stopDistFixed :
 // A stop tighter than the spread plus a tick is not a stop, it is a coin flip
 // with leverage. Reject the signal instead of trading a distance that would
 // size the position into the stratosphere.
+//
+// The > 0 test also catches the anchor landing on the WRONG SIDE of the entry,
+// which the 'Previous' anchor makes possible: on a fast move the prior candle's
+// low can sit above the signal close, so a long would have its stop above its
+// entry. Those signals are dropped and counted as "stop too tight".
 stopOk = stopMode != 'SIGNAL' or (stopDist >= minStopUsd and stopDist > 0)
 
 longSignal  = longSignal0  and stopOk
@@ -272,12 +291,12 @@ var float anchorStop = na
 if canTrade and qty > 0 and (allowAdds or strategy.position_size == 0)
     if longSignal
         entrySeq += 1
-        anchorStop := low - buf
+        anchorStop := slLongPx
         strategy.entry('L' + str.tostring(entrySeq), strategy.long, qty=qty)
         tradesToday += 1
     else if shortSignal
         entrySeq += 1
-        anchorStop := high + buf
+        anchorStop := slShortPx
         strategy.entry('S' + str.tostring(entrySeq), strategy.short, qty=qty)
         tradesToday += 1
 
