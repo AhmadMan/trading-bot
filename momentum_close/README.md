@@ -242,11 +242,19 @@ size limited only by the broker. `minStopUsd` (default $0.80) rejects those
 signals outright; the count appears in the funnel table as "stop too tight". Do
 not set it to zero.
 
-**`flatAtWinClose` and a 1:1 target are in tension.** The window close was the
+**`flatAtWinClose` defaults OFF, and that is deliberate.** The window close was the
 original premise — the edge lives in the final minutes and does not survive
 being held. A 1:1 target needs room to be reached. Leave the flatten on and most
 trades exit at the boundary with the target rarely firing; turn it off and the
 trade is decided by stop and target alone, which is what a 1:1 RR strategy
-normally means. It defaults on to preserve existing behaviour. **Decide which
-strategy you are testing before reading the result**, because the two produce
-completely different trade populations from the same signals.
+normally means. It now defaults off, because with it on
+every `targetR` above roughly 1 gave the same result — the boundary arrived
+within a few bars and cut the trade before a 2R or 3R target could be touched,
+which looks exactly like "the strategy is ignoring my RR setting". Turn it back
+on only to test the original momentum-into-close idea, not an RR strategy.
+**Decide which of the two you are testing before reading the result**, because
+they produce completely different trade populations from the same signals.
+
+The live stop and target are plotted while a position is open, so the levels the
+strategy is actually working can be read off the chart rather than inferred from
+the trade list.

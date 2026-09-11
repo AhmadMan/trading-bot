@@ -71,15 +71,17 @@ minStopUsd   = input.float(0.80, 'Reject signal if stop is tighter than ($)', mi
 useTarget    = input.bool(true,  'Use profit target',          group='Exit')
 targetR      = input.float(1.0,  'Target (R multiples)',       minval=0.1, step=0.1, group='Exit')
 
-// The window close is the original premise: the edge lives in the final minutes
-// and does not survive being held. A 1:1 target needs room to be reached, so
-// leaving this on means most trades exit at the boundary and the target rarely
-// fires - turn it off to let stop and target decide the trade.
-flatAtWinClose = input.bool(true, 'Flatten at window close', group='Exit')
+// OFF by default now. The window close was the original premise - the edge lives
+// in the final minutes and does not survive being held - but it makes testing a
+// reward:risk ratio impossible: the boundary arrives within a few bars and cuts
+// the trade long before a 2R or 3R target could be touched, so every targetR
+// above about 1 produced the same result. Turn it back on only to test the
+// original momentum-into-close idea, not an RR strategy.
+flatAtWinClose = input.bool(false, 'Flatten at window close', group='Exit')
 
 riskPct      = input.float(0.3,  'Risk per trade (% equity)',  minval=0.01, maxval=5.0, step=0.05, group='Risk')
 maxTrades    = input.int(20,     'Max trades per day',         minval=1,            group='Risk')
-dailyLossPct = input.float(3.0,  'Daily loss stop (% equity)', minval=0.1, step=0.5, group='Risk')
+dailyLossPct = input.float(0.0,  'Daily loss stop (% equity), 0 = off', minval=0.0, step=0.5, group='Risk')
 minAtr       = input.float(0.0,  'Min ATR to trade ($), 0=off', minval=0.0, step=0.1, group='Risk')
 maxAtr       = input.float(0.0,  'Max ATR to trade ($), 0=off', minval=0.0, step=0.5, group='Risk')
 
@@ -172,7 +174,9 @@ if newDay
     haltedToday    := false
 
 dayPnlPct = dayStartEquity > 0 ? (strategy.equity - dayStartEquity) / dayStartEquity * 100 : 0.0
-if dayPnlPct <= -dailyLossPct
+// 0 disables the governor entirely: without this guard a threshold of 0 halts
+// the moment the day is a cent down, which silently empties the backtest.
+if dailyLossPct > 0 and dayPnlPct <= -dailyLossPct
     haltedToday := true
 
 // Hour blocking. Parsed each bar rather than cached: str.split on a short
@@ -302,6 +306,11 @@ if canTrade and qty > 0 and (allowAdds or strategy.position_size == 0)
 
 // Protective bracket, evaluated intrabar: strategy.exit fills the moment price
 // touches either level, which is the "close on the touch" behaviour.
+// Held for plotting, so the levels the strategy is actually working can be read
+// off the chart instead of inferred from the trade list.
+var float liveStop = na
+var float liveTgt  = na
+
 if strategy.position_size != 0
     entryPx = strategy.position_avg_price
     isLong  = strategy.position_size > 0
@@ -317,6 +326,9 @@ if strategy.position_size != 0
     riskPx = math.abs(entryPx - sl)
     tp = useTarget ? (isLong ? entryPx + riskPx * targetR : entryPx - riskPx * targetR) : na
 
+    liveStop := sl
+    liveTgt  := tp
+
     // No from_entry: with unique per-add IDs the stop has to cover every open
     // entry, not just one of them.
     strategy.exit('X', stop=sl, limit=tp)
@@ -329,12 +341,14 @@ if flatAtWinClose and isLastBar and strategy.position_size != 0
 
 if strategy.position_size == 0
     anchorStop := na
+    liveStop   := na
+    liveTgt    := na
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Visuals
 // ─────────────────────────────────────────────────────────────────────────────
-plot(strategy.position_size != 0 and stopMode == 'SIGNAL' ? anchorStop : na, 'Signal stop',
-     color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(liveStop, 'Stop',   color=color.new(color.red,  0), style=plot.style_linebr, linewidth=2)
+plot(liveTgt,  'Target', color=color.new(color.teal, 0), style=plot.style_linebr, linewidth=2)
 
 plot(winOpen, 'Window open', color=color.new(color.gray, 40), style=plot.style_stepline)
 bgcolor(isEntryBar ? color.new(color.blue, 90) : na, title='Entry bar')
