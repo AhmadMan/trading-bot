@@ -207,3 +207,35 @@ Two things it cannot do: a limit breached by a weekend gap happens with no ticks
 to act on (which is what `InpNoEntryFriHr`, now `19`, is for), and it governs
 only positions carrying `InpMagic` on this symbol — anything you trade manually
 in the same account is invisible to it and still counts against your limits.
+
+## Signal-candle stop with 1:1 target
+
+`stopMode = 'SIGNAL'` places the stop just beyond the signal candle instead of a
+fixed or ATR distance: under the candle's low for a long, over its high for a
+short, plus `bufUsd` (default $0.30) or `bufAtrMult`. `useTarget` defaults on
+with `targetR = 1.0`, so the target sits the same distance the other side of the
+fill. `strategy.exit` fills the instant either level trades, which is the
+close-on-touch behaviour.
+
+Three things this changes that are easy to miss:
+
+**Risk is measured from the fill, not the signal close.** The stop is a *price*
+fixed by the candle; the entry fills at the next bar's open. So the target is
+computed from `position_avg_price` against that fixed stop — `targetR = 1` is a
+true 1:1 on realised risk, not on the distance estimated at signal time. The two
+differ by whatever the market did between the signal close and the fill.
+
+**A tight signal candle means a huge position.** Position size is
+`risk / stop distance`, so a doji signal candle implies a near-zero stop and a
+size limited only by the broker. `minStopUsd` (default $0.80) rejects those
+signals outright; the count appears in the funnel table as "stop too tight". Do
+not set it to zero.
+
+**`flatAtWinClose` and a 1:1 target are in tension.** The window close was the
+original premise — the edge lives in the final minutes and does not survive
+being held. A 1:1 target needs room to be reached. Leave the flatten on and most
+trades exit at the boundary with the target rarely firing; turn it off and the
+trade is decided by stop and target alone, which is what a 1:1 RR strategy
+normally means. It defaults on to preserve existing behaviour. **Decide which
+strategy you are testing before reading the result**, because the two produce
+completely different trade populations from the same signals.
