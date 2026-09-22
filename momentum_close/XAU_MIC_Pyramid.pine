@@ -1,0 +1,131 @@
+//@version=6
+// XAU Momentum Into Close — pyramid version
+//
+// Trades the same green/red signals the base script plots, but manages the
+// position the way a pyramid does rather than flattening at the window close:
+//
+//   1st signal in a direction  -> open the position. No stop yet.
+//   2nd signal, same direction -> add, and place the stop at the LOW of the
+//                                 first signal candle (HIGH for shorts).
+//   3rd+ signal, same direction-> add again. The stop stays on that first
+//                                 candle unless "trail to latest" is enabled.
+//   Opposite signal            -> close everything (optionally reverse).
+//
+// Note on risk: between the 1st and 2nd signal the position has no stop. That
+// is what "SL after a second signal" means, and on the chart many signals never
+// get a second one. `useSafetyStop` adds an ATR stop that holds until the real
+// anchor exists; it is off by default so the default matches the spec.
+
+strategy('XAU MIC Pyramid', shorttitle='XAU_MIC_P', overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     pyramiding=10,
+     commission_type=strategy.commission.percent,
+     commission_value=0.01)
+
+// ── Signal (unchanged from the base script) ─────────────────────────────────
+winMin   = input.int(5,   'Window (minutes)',          minval=2,  group='Signal')
+leadMin  = input.int(2,   'Signal window: N mins left', minval=1, group='Signal')
+atrMult  = input.float(1.0, 'Move needed (x ATR)', step=0.1,      group='Signal')
+atrLen   = input.int(14,  'ATR length',                minval=1,  group='Signal')
+
+// ── Pyramid management ──────────────────────────────────────────────────────
+stopAfter     = input.int(2, 'Place stop after N signals', minval=2, group='Pyramid')
+trailToLatest = input.bool(false, 'Move stop to latest signal candle', group='Pyramid')
+reverseOnOpp  = input.bool(false, 'Reverse on opposite signal',        group='Pyramid')
+useSafetyStop = input.bool(false, 'Safety stop before anchor exists',  group='Pyramid')
+safetyAtr     = input.float(3.0, 'Safety stop (x ATR)', step=0.5,      group='Pyramid')
+
+atr = ta.atr(atrLen)
+
+// ── Window clock ────────────────────────────────────────────────────────────
+// Tolerant of any intraday timeframe: the signal slot is the last `leadMin`
+// minutes of the window and fires at most once per window, so the script does
+// not go silent when the chart timeframe does not divide the window evenly.
+tfMin    = math.max(1, int(math.round(timeframe.in_seconds(timeframe.period) / 60)))
+winMs    = winMin * 60000
+winId    = math.floor(time / winMs)
+minsLeft = winMin - int(time % winMs / 60000) - tfMin
+
+var float winOpen = na
+var bool  firedThisWindow = false
+if winId != winId[1]
+    winOpen := open
+    firedThisWindow := false
+
+inSlot = minsLeft <= leadMin and minsLeft >= 0 and not firedThisWindow
+move   = close - winOpen
+
+longSignal  = inSlot and not na(atr) and move >=  atr * atrMult
+shortSignal = inSlot and not na(atr) and move <= -atr * atrMult
+if longSignal or shortSignal
+    firedThisWindow := true
+
+// ── Pyramid state ───────────────────────────────────────────────────────────
+// sigCount is how many same-direction signals have fired in the current
+// sequence; anchorLow/High is the candle the stop is measured from.
+var int   sigCount  = 0
+var float anchorLow = na
+var float anchorHi  = na
+
+if strategy.position_size == 0
+    sigCount  := 0
+    anchorLow := na
+    anchorHi  := na
+
+if longSignal
+    if strategy.position_size < 0
+        strategy.close_all(comment='opposite signal')
+        sigCount := 0
+    if strategy.position_size <= 0
+        if strategy.position_size == 0 or reverseOnOpp
+            sigCount  := 1
+            anchorLow := low
+            anchorHi  := high
+            strategy.entry('L1', strategy.long)
+    else
+        sigCount += 1
+        if trailToLatest
+            anchorLow := low
+        strategy.entry('L' + str.tostring(sigCount), strategy.long)
+
+if shortSignal
+    if strategy.position_size > 0
+        strategy.close_all(comment='opposite signal')
+        sigCount := 0
+    if strategy.position_size >= 0
+        if strategy.position_size == 0 or reverseOnOpp
+            sigCount  := 1
+            anchorLow := low
+            anchorHi  := high
+            strategy.entry('S1', strategy.short)
+    else
+        sigCount += 1
+        if trailToLatest
+            anchorHi := high
+        strategy.entry('S' + str.tostring(sigCount), strategy.short)
+
+// ── Stop ────────────────────────────────────────────────────────────────────
+// The real stop only exists once `stopAfter` signals have stacked. Before that
+// the position is unprotected unless the safety stop is switched on.
+anchorReady = sigCount >= stopAfter
+isLong      = strategy.position_size > 0
+
+stopPrice = float(na)
+if strategy.position_size != 0
+    if anchorReady
+        stopPrice := isLong ? anchorLow : anchorHi
+    else if useSafetyStop and not na(atr)
+        safetyDist = atr * safetyAtr
+        stopPrice := isLong ? strategy.position_avg_price - safetyDist : strategy.position_avg_price + safetyDist
+
+if strategy.position_size != 0 and not na(stopPrice)
+    strategy.exit('stop', stop=stopPrice)
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(winOpen, 'Window open', color.new(color.gray, 50), style=plot.style_stepline)
+stopPlot = strategy.position_size != 0 and not na(stopPrice) ? stopPrice : na
+plot(stopPlot, 'Stop', color=anchorReady ? color.red : color.orange, style=plot.style_linebr, linewidth=2)
+plotshape(longSignal,  'Buy',  shape.triangleup,   location.belowbar, color.new(color.teal, 0), size=size.tiny)
+plotshape(shortSignal, 'Sell', shape.triangledown, location.abovebar, color.new(color.red,  0), size=size.tiny)
