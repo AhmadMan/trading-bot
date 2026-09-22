@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| MIC_Probe.mq5 — does this terminal trade at all?                  |
+//| MIC_Probe.mq5 - does this terminal trade at all?                  |
 //|                                                                  |
 //| Deliberately stupid. No ATR, no threshold, no risk sizing, no     |
 //| session, no spread guard, no daily governor. It buys 0.01 lots at |
@@ -61,7 +61,7 @@ void OnDeinit(const int reason)
    if(slots == 0)
       Print("PROBE     | No entry slot was ever reached: no M1 bars, or the lead is unreachable on this timeframe.");
    else if(sent == 0)
-      Print("PROBE     | Slots reached but no order succeeded — read the retcodes above.");
+      Print("PROBE     | Slots reached but no order succeeded - read the retcodes above.");
 }
 
 void OnTick()
@@ -95,7 +95,7 @@ void OnTick()
       if(pos.SelectByIndex(i) && pos.Symbol() == _Symbol && pos.Magic() == InpMagic)
          return;   // already in one
 
-   // Direction is arbitrary — this measures whether an order can be placed,
+   // Direction is arbitrary - this measures whether an order can be placed,
    // not whether it should be.
    bool up = iClose(_Symbol, PERIOD_M1, 1) >= iOpen(_Symbol, PERIOD_M1, 1);
    bool ok = up ? trade.Buy(InpLots, _Symbol, 0.0, 0.0, 0.0, "probe")
