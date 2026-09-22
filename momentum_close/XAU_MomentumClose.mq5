@@ -14,7 +14,7 @@
 //| something.                                                        |
 //+------------------------------------------------------------------+
 #property copyright "trading-bot"
-#property version   "1.40"
+#property version   "1.50"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -65,7 +65,12 @@ input double InpBufAtrMult     = 0.10;   // SIGNAL buffer (ATR mult)
 // near-zero stop and a size limited only by the broker. Reject those.
 input double InpMinStopUsd     = 0.80;   // Reject signal if stop is tighter than ($)
 input bool   InpUseTarget      = true;   // Use profit target
-input double InpTargetR        = 1.0;    // Target (R multiples)
+// 2R is the ratio the risk ladder is built around: its progression only pays
+// for itself if a win returns twice what a loss costs. Note that setting the
+// ratio does not create it - a 2R target is reached less often than a 1R one,
+// so the win rate falls and the two effects have to be measured against each
+// other, not assumed. Break-even at 2R is a 33.3% win rate.
+input double InpTargetR        = 2.0;    // Target (R multiples)
 // The window close was the original premise, but it cuts the trade within a few
 // bars - so any target above roughly 1R could never be reached with it on, and
 // every InpTargetR produced the same result. Off means stop and target decide.
@@ -92,13 +97,20 @@ input bool   InpLadderEnable     = false; // Use the risk ladder instead of InpR
 input double InpLadderBasePct    = 0.5;   // Base risk (% equity), recomputed daily
 input double InpLadderMult       = 1.5;   // Risk multiplier after a loss
 input double InpLadderMaxPct     = 5.0;   // Hard per-trade risk cap (% equity)
-input int    InpLadderMaxLosses  = 3;     // Stop for the day after N consecutive losses, 0 = off
+input int    InpLadderMaxLosses  = 5;     // Stop for the day after N consecutive losses, 0 = off
 input double InpLadderDayLossPct = 2.0;   // Stop for the day at this daily loss (% equity), 0 = off
 input double InpLadderMaxDDPct   = 25.0;  // Freeze progression above this peak-to-trough DD, 0 = off
 // Time-based exits close trades between -1R and +1R, so most results are not
 // clean wins or losses. A result inside +/- this many currency units is a
 // scratch: it neither advances the ladder nor resets it.
 input double InpLadderScratchCcy = 0.0;   // Dead band around zero (account currency)
+// The consecutive-loss stop and the daily loss stop are two ways of saying the
+// same thing, and whichever is tighter silences the other. A 0.5% base at 1.5x
+// costs 6.59% of equity to run five losses, so a 2% daily limit ends the day on
+// the third - and raising the loss count alone changes nothing. This solves the
+// base instead: base = DayLossPct / (1 + m + m^2 + ... + m^(n-1)), so the full
+// ladder depth spends exactly the daily budget and both stops bind together.
+input bool   InpLadderAutoBase   = true;  // Derive base risk so N losses = the daily loss limit
 
 //--- Risk
 input double InpRiskPct        = 0.3;    // Risk per trade (% equity)
@@ -139,7 +151,13 @@ input double InpFtmoTargetPct  = 0.0;    // Stop for the day at +N% profit, 0 = 
 // inputs remove that trade so the remaining sample answers the actual
 // question: does late-window momentum in gold pay for its own spread?
 input int    InpNoEntryFriHr   = 19;     // No new entries Friday from this hour, 0 = off
-input int    InpMaxHoldMin     = 15;     // Force-flat a position older than N min, 0 = off
+// The hold limit is a ceiling on how far a target can be reached. At 15 minutes
+// a 2R target on an M1 signal-candle stop is mostly cut short by the clock, so
+// the ratio would be nominal: losses run their full -1R while winners are
+// truncated well before +2R, which is the arithmetic the ladder cannot survive.
+// 45 minutes leaves the target room and still closes the position long before
+// the weekend gap this input exists to avoid.
+input int    InpMaxHoldMin     = 45;     // Force-flat a position older than N min, 0 = off
 
 //--- Plumbing
 input long   InpMagic          = 590105;
@@ -290,35 +308,64 @@ int OnInit()
          Print("Init failed: InpLadderBasePct must be > 0 and InpLadderMult >= 1.");
          return(INIT_PARAMETERS_INCORRECT);
       }
-      if(InpLadderMaxPct > 0.0 && InpLadderMaxPct < InpLadderBasePct)
+      if(InpLadderMaxPct > 0.0 && InpLadderMaxPct < LadderBasePct())
       {
          Print("Init failed: InpLadderMaxPct is below InpLadderBasePct - every trade would be capped.");
          return(INIT_PARAMETERS_INCORRECT);
       }
 
-      // The per-trade cap only ever engages if the day can run long enough to
-      // reach it. Say so at init rather than letting a dead parameter look live.
-      if(InpLadderMaxLosses > 0 && InpLadderMult > 1.0)
+      // Every stop here can be silenced by a tighter one. Rather than let a dead
+      // parameter look live, walk the ladder at init and say which rule ends
+      // the day and what the others would have allowed.
+      if(InpLadderMaxLosses > 0)
       {
-         double reach = InpLadderBasePct * MathPow(InpLadderMult, InpLadderMaxLosses - 1);
-         if(InpLadderMaxPct > 0.0 && reach < InpLadderMaxPct)
-            PrintFormat("Ladder note: with %d consecutive losses allowed the risk tops out at %.2f%%, "
-                        "below the %.2f%% cap - the consecutive-loss stop is the binding limit.",
-                        InpLadderMaxLosses, reach, InpLadderMaxPct);
+         double basePct = LadderBasePct();
+         double riskPct = basePct;
+         double cumPct  = 0.0;
+         int    bindsAt = 0;
+         string binder  = "consecutive-loss stop";
+
+         PrintFormat("Ladder ladder-depth check (base %.4f%%%s):",
+                     basePct, InpLadderAutoBase ? ", auto-derived" : "");
+         for(int n = 1; n <= InpLadderMaxLosses; n++)
+         {
+            double sized = (InpLadderMaxPct > 0.0 && riskPct > InpLadderMaxPct)
+                         ? InpLadderMaxPct : riskPct;
+            cumPct += sized;
+            PrintFormat("    loss %d: risk %.4f%%%s  cumulative %.4f%%",
+                        n, sized, sized < riskPct ? " (capped)" : "", cumPct);
+
+            if(bindsAt == 0 && InpLadderDayLossPct > 0.0 && cumPct >= InpLadderDayLossPct)
+            {
+               bindsAt = n;
+               if(n < InpLadderMaxLosses)
+                  binder = "daily loss stop";
+            }
+            riskPct *= InpLadderMult;
+         }
+
+         if(bindsAt > 0 && bindsAt < InpLadderMaxLosses)
+            PrintFormat("Ladder WARNING: the %.2f%% daily loss stop ends the day on loss %d, "
+                        "so InpLadderMaxLosses=%d is unreachable. Enable InpLadderAutoBase, "
+                        "or raise InpLadderDayLossPct to %.2f%%.",
+                        InpLadderDayLossPct, bindsAt, InpLadderMaxLosses, cumPct);
+         else
+            PrintFormat("Ladder: worst day = %d losses costing %.2f%% of equity (%s binds).",
+                        InpLadderMaxLosses, cumPct, binder);
       }
 
       ladderPeakEq = AccountInfoDouble(ACCOUNT_EQUITY);
       LadderResetDay();
 
-      PrintFormat("Ladder ON - base=%.2f%% mult=%.2fx cap=%.2f%% | stops: %d consec losses, %.2f%% day, %.2f%% DD",
-                  InpLadderBasePct, InpLadderMult, InpLadderMaxPct,
+      PrintFormat("Ladder ON - base=%.4f%% mult=%.2fx cap=%.2f%% | stops: %d consec losses, %.2f%% day, %.2f%% DD",
+                  LadderBasePct(), InpLadderMult, InpLadderMaxPct,
                   InpLadderMaxLosses, InpLadderDayLossPct, InpLadderMaxDDPct);
    }
 
    PrintFormat("MIC init OK - %s %s | window=%dm lead=%dm | sizing=%s | thresh=%s | stop=%s | target=%s | flat_at_close=%s | digits=%d point=%g",
                _Symbol, EnumToString((ENUM_TIMEFRAMES)Period()),
                InpWindowMin, InpEntryLeadMin,
-               InpLadderEnable ? StringFormat("ladder %.2f%% base", InpLadderBasePct)
+               InpLadderEnable ? StringFormat("ladder %.4f%% base", LadderBasePct())
                                : InpUseFixedLot ? StringFormat("fixed %.2f lots", InpFixedLots)
                               : StringFormat("%.2f%% risk", InpRiskPct),
                InpUseAtrThresh ? StringFormat("%.2f x ATR", InpMoveAtrMult)
@@ -683,11 +730,35 @@ void TryEnter(const datetime signalBar)
 //| winning day with a lower chance of a large losing one. The stops  |
 //| below are what keep that trade honest.                            |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| The base risk % actually used. With InpLadderAutoBase on it is    |
+//| solved from the daily loss budget so that a full run of           |
+//| InpLadderMaxLosses spends exactly that budget and no more, which  |
+//| is what makes the loss count the real stop rather than a number   |
+//| the daily limit silently overrides.                               |
+//|                                                                   |
+//| Sum of the geometric progression b(1 + m + ... + m^(n-1)) = L.    |
+//+------------------------------------------------------------------+
+double LadderBasePct()
+{
+   if(!InpLadderAutoBase || InpLadderMaxLosses <= 0 || InpLadderDayLossPct <= 0.0)
+      return(InpLadderBasePct);
+
+   double sum = 0.0;
+   for(int i = 0; i < InpLadderMaxLosses; i++)
+      sum += MathPow(InpLadderMult, i);
+
+   if(sum <= 0.0)
+      return(InpLadderBasePct);
+
+   return(InpLadderDayLossPct / sum);
+}
+
 void LadderResetDay()
 {
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
 
-   ladderBaseCash = eq * InpLadderBasePct / 100.0;
+   ladderBaseCash = eq * LadderBasePct() / 100.0;
    ladderRiskCash = ladderBaseCash;
    ladderLosses   = 0;
    ladderDayPnl   = 0.0;
@@ -697,8 +768,8 @@ void LadderResetDay()
       ladderPeakEq = eq;
 
    if(InpLadderEnable && InpVerbose)
-      PrintFormat("Ladder day reset - equity=%.2f base=%.2f cap=%.2f",
-                  eq, ladderBaseCash, eq * InpLadderMaxPct / 100.0);
+      PrintFormat("Ladder day reset - equity=%.2f base=%.2f (%.4f%%) cap=%.2f",
+                  eq, ladderBaseCash, LadderBasePct(), eq * InpLadderMaxPct / 100.0);
 }
 
 //+------------------------------------------------------------------+

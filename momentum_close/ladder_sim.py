@@ -26,10 +26,25 @@ class Ladder:
     base_pct: float = 0.005      # InpLadderBasePct
     mult: float = 1.5            # InpLadderMult
     max_pct: float = 0.05        # InpLadderMaxPct
-    max_losses: int = 3          # InpLadderMaxLosses (consecutive, per day)
+    max_losses: int = 5          # InpLadderMaxLosses (consecutive, per day)
     day_loss_pct: float = 0.02   # InpLadderDayLossPct
     max_dd_pct: float = 0.25     # InpLadderMaxDDPct
     rr: float = 2.0              # reward-to-risk on a win
+    auto_base: bool = True       # InpLadderAutoBase
+
+    def effective_base(self) -> float:
+        """Base risk actually used, mirroring LadderBasePct() in the EA.
+
+        With auto_base on, the base is solved so that a full run of
+        max_losses spends exactly the daily loss budget:
+            b(1 + m + ... + m^(n-1)) = L
+        Without it, the two stops fight and the tighter one silences the
+        other.
+        """
+        if not (self.auto_base and self.max_losses and self.day_loss_pct):
+            return self.base_pct
+        denom = sum(self.mult ** i for i in range(self.max_losses))
+        return self.day_loss_pct / denom if denom else self.base_pct
 
 
 @dataclass
@@ -75,7 +90,7 @@ def simulate(
         if eq <= start * ruin_at:
             break
 
-        base = eq * lad.base_pct
+        base = eq * lad.effective_base()
         risk = base
         losses = 0
         day_pnl = 0.0
@@ -157,7 +172,7 @@ def streak(n: int, lad: Ladder, start: float = 3000.0) -> dict:
     left = n
     days = 0
     while left > 0:
-        base = eq * lad.base_pct
+        base = eq * lad.effective_base()
         risk = base
         day_pnl = 0.0
         day_start = eq
@@ -205,7 +220,8 @@ def main() -> None:
     a = ap.parse_args()
 
     lad = Ladder(rr=a.rr)
-    flat = replace(lad, mult=1.0)  # same everything, no progression
+    flat = replace(lad, mult=1.0, auto_base=False,
+                   base_pct=lad.effective_base())  # same risk, no progression
 
     print(f"\nLADDER: base {lad.base_pct:.2%} x{lad.mult} cap {lad.max_pct:.0%} | "
           f"stops {lad.max_losses} losses / {lad.day_loss_pct:.0%} day / "
@@ -215,19 +231,26 @@ def main() -> None:
     print("=" * 74)
     print("A. REACHABLE RISK  (what the ladder can actually size to)")
     print("=" * 74)
-    r = lad.base_pct
-    for step in range(1, lad.max_losses + 3):
-        capped = min(r, lad.max_pct)
-        tag = ""
-        if step > lad.max_losses:
-            tag = "  <- unreachable: daily stop fires first"
-        elif r > lad.max_pct:
-            tag = "  <- capped"
-        print(f"  after {step - 1} losses: risk {capped:>7.3%}{tag}")
+    b = lad.effective_base()
+    print(f"  base risk: {b:.4%}"
+          f"{'  (auto-derived from the daily loss limit)' if lad.auto_base else ''}")
+    r, cum, binds = b, 0.0, 0
+    for step in range(1, lad.max_losses + 1):
+        sized = min(r, lad.max_pct)
+        cum += sized
+        tag = "  <- capped" if sized < r else ""
+        if not binds and lad.day_loss_pct and cum >= lad.day_loss_pct:
+            binds = step
+            tag += "  <- daily loss limit reached here"
+        print(f"  loss {step}: risk {sized:>8.4%}   cumulative {cum:>8.4%}{tag}")
         r *= lad.mult
-    need = int(np.ceil(np.log(lad.max_pct / lad.base_pct) / np.log(lad.mult)))
-    print(f"\n  The {lad.max_pct:.0%} cap needs {need} consecutive losses to engage,")
-    print(f"  but the daily stop ends the day at {lad.max_losses}. The cap is never reached.")
+    print(f"\n  Worst constructible day: {lad.max_losses} losses = {cum:.4%} of equity.")
+    if binds and binds < lad.max_losses:
+        print(f"  WARNING: the {lad.day_loss_pct:.2%} daily stop ends the day on loss "
+              f"{binds} - the {lad.max_losses}-loss setting is unreachable.")
+    need = int(np.ceil(np.log(lad.max_pct / b) / np.log(lad.mult)))
+    print(f"  The {lad.max_pct:.0%} per-trade cap needs {need} consecutive losses "
+          f"to engage: still never reached.")
 
     print("\n" + "=" * 74)
     print("B. LOSING-STREAK STRESS TEST")
@@ -303,8 +326,8 @@ def main() -> None:
     print(hdr2)
     print("  " + "-" * (len(hdr2) - 2))
     for label, p_win, rr in cases:
-        for name, mult in (("ladder", lad.mult), ("flat", 1.0)):
-            cfg = replace(lad, rr=rr, mult=mult)
+        for name, cfgbase in (("ladder", lad), ("flat", flat)):
+            cfg = replace(cfgbase, rr=rr)
             m = monte_carlo(p_win, cfg, paths=max(4000, a.paths // 2),
                             days=a.days, trades_per_day=a.tpd,
                             start=a.start, seed=a.seed)
