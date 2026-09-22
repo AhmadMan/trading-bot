@@ -14,7 +14,7 @@
 //| something.                                                        |
 //+------------------------------------------------------------------+
 #property copyright "trading-bot"
-#property version   "1.30"
+#property version   "1.40"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -78,6 +78,27 @@ input bool   InpFlatAtWinClose = false;  // Flatten at the window boundary
 input bool   InpUseFixedLot    = false;  // Trade a fixed lot instead of risk %
 input double InpFixedLots      = 0.10;   // Lot size when fixed sizing is on
 input double InpMaxLots        = 0.0;    // Hard lot cap, 0 = broker maximum
+
+//--- Risk ladder (survival-first progression)
+// Base risk is a fixed % of equity, recomputed once per trading day. A loss
+// multiplies the NEXT trade's risk by InpLadderMult; any win resets it to base.
+// Three hard stops bound the progression: a per-trade % cap, a consecutive-loss
+// count, and a daily loss %. The consecutive-loss stop is the binding one -
+// with the defaults below the ladder can only reach step 3 (0.5 -> 0.75 ->
+// 1.125%) before the day ends, so the 5% per-trade cap never actually engages.
+// That is deliberate: the cap is a backstop for looser settings, not the
+// mechanism. Raise InpLadderMaxLosses if you want the cap to matter.
+input bool   InpLadderEnable     = false; // Use the risk ladder instead of InpRiskPct
+input double InpLadderBasePct    = 0.5;   // Base risk (% equity), recomputed daily
+input double InpLadderMult       = 1.5;   // Risk multiplier after a loss
+input double InpLadderMaxPct     = 5.0;   // Hard per-trade risk cap (% equity)
+input int    InpLadderMaxLosses  = 3;     // Stop for the day after N consecutive losses, 0 = off
+input double InpLadderDayLossPct = 2.0;   // Stop for the day at this daily loss (% equity), 0 = off
+input double InpLadderMaxDDPct   = 25.0;  // Freeze progression above this peak-to-trough DD, 0 = off
+// Time-based exits close trades between -1R and +1R, so most results are not
+// clean wins or losses. A result inside +/- this many currency units is a
+// scratch: it neither advances the ladder nor resets it.
+input double InpLadderScratchCcy = 0.0;   // Dead band around zero (account currency)
 
 //--- Risk
 input double InpRiskPct        = 0.3;    // Risk per trade (% equity)
@@ -171,6 +192,18 @@ bool     haltedToday     = false;
 double   ftmoStartBal    = 0.0;
 bool     ftmoBreached    = false;  // overall limit hit: stop trading permanently
 
+// Risk-ladder state. ladderRisk is an absolute cash figure, not a percentage:
+// the base is struck from equity once a day and the progression then works in
+// currency, so a mid-day equity swing cannot silently resize the ladder.
+double   ladderBaseCash  = 0.0;   // BaseRisk = day-start equity * InpLadderBasePct
+double   ladderRiskCash  = 0.0;   // risk for the NEXT trade
+int      ladderLosses    = 0;     // consecutive losses, reset by any win
+double   ladderDayPnl    = 0.0;   // realised P/L since the day rolled
+double   ladderPeakEq    = 0.0;   // high-water equity, for the drawdown rule
+bool     ladderDDFreeze  = false; // drawdown limit breached: base risk only
+ulong    ladderLastDeal  = 0;     // highest closing deal ticket already counted
+datetime ladderScanFrom  = 0;     // history window start for the deal scan
+
 //+------------------------------------------------------------------+
 int OnInit()
 {
@@ -245,10 +278,48 @@ int OnInit()
 
    // If this line is absent from the Journal, the EA never started and nothing
    // below it ran — that is a setup problem, not a signal problem.
+   if(InpLadderEnable)
+   {
+      if(InpUseFixedLot)
+      {
+         Print("Init failed: the risk ladder sizes by risk, so InpUseFixedLot must be off.");
+         return(INIT_PARAMETERS_INCORRECT);
+      }
+      if(InpLadderBasePct <= 0.0 || InpLadderMult < 1.0)
+      {
+         Print("Init failed: InpLadderBasePct must be > 0 and InpLadderMult >= 1.");
+         return(INIT_PARAMETERS_INCORRECT);
+      }
+      if(InpLadderMaxPct > 0.0 && InpLadderMaxPct < InpLadderBasePct)
+      {
+         Print("Init failed: InpLadderMaxPct is below InpLadderBasePct - every trade would be capped.");
+         return(INIT_PARAMETERS_INCORRECT);
+      }
+
+      // The per-trade cap only ever engages if the day can run long enough to
+      // reach it. Say so at init rather than letting a dead parameter look live.
+      if(InpLadderMaxLosses > 0 && InpLadderMult > 1.0)
+      {
+         double reach = InpLadderBasePct * MathPow(InpLadderMult, InpLadderMaxLosses - 1);
+         if(InpLadderMaxPct > 0.0 && reach < InpLadderMaxPct)
+            PrintFormat("Ladder note: with %d consecutive losses allowed the risk tops out at %.2f%%, "
+                        "below the %.2f%% cap - the consecutive-loss stop is the binding limit.",
+                        InpLadderMaxLosses, reach, InpLadderMaxPct);
+      }
+
+      ladderPeakEq = AccountInfoDouble(ACCOUNT_EQUITY);
+      LadderResetDay();
+
+      PrintFormat("Ladder ON - base=%.2f%% mult=%.2fx cap=%.2f%% | stops: %d consec losses, %.2f%% day, %.2f%% DD",
+                  InpLadderBasePct, InpLadderMult, InpLadderMaxPct,
+                  InpLadderMaxLosses, InpLadderDayLossPct, InpLadderMaxDDPct);
+   }
+
    PrintFormat("MIC init OK - %s %s | window=%dm lead=%dm | sizing=%s | thresh=%s | stop=%s | target=%s | flat_at_close=%s | digits=%d point=%g",
                _Symbol, EnumToString((ENUM_TIMEFRAMES)Period()),
                InpWindowMin, InpEntryLeadMin,
-               InpUseFixedLot ? StringFormat("fixed %.2f lots", InpFixedLots)
+               InpLadderEnable ? StringFormat("ladder %.2f%% base", InpLadderBasePct)
+                               : InpUseFixedLot ? StringFormat("fixed %.2f lots", InpFixedLots)
                               : StringFormat("%.2f%% risk", InpRiskPct),
                InpUseAtrThresh ? StringFormat("%.2f x ATR", InpMoveAtrMult)
                                : StringFormat("$%.2f", InpMoveThreshUsd),
@@ -288,6 +359,20 @@ void OnTick()
    if(!PropGuard())
       return;
 
+   // Ladder state is account state, so it is maintained on every tick, ahead of
+   // the bar gate: a stop filled mid-bar must move the ladder and can trip the
+   // consecutive-loss stop before the next entry slot is even considered.
+   if(InpLadderEnable)
+   {
+      LadderTrackDrawdown();
+      LadderPoll();
+   }
+
+   // The max-hold backstop exists for the case where bars stop printing - an
+   // illiquid window, a halt, a weekend - so it cannot live behind the bar gate
+   // that those same conditions freeze.
+   EnforceMaxHold();
+
    // Everything is decided on closed M1 bars, matching the Pine version's
    // calc_on_every_tick=false. Intrabar ticks only matter for the broker-side
    // stop, which is already sitting on the server.
@@ -297,7 +382,6 @@ void OnTick()
    lastBarTime = barTime;
 
    RollDay();
-   EnforceMaxHold();
 
    MqlDateTime fd;
    TimeToStruct(closedBarOrNow(), fd);
@@ -385,7 +469,8 @@ void PrintFunnel(const string tag)
 void TryEnter(const datetime signalBar)
 {
    signalBars++;
-   if(haltedToday || tradesToday >= InpMaxTradesDay || !InSession(signalBar))
+   if(haltedToday || tradesToday >= InpMaxTradesDay || !InSession(signalBar)
+      || (InpLadderEnable && LadderRiskForTrade() <= 0.0))
    {
       rejGovernor++;
       return;
@@ -589,6 +674,178 @@ void TryEnter(const datetime signalBar)
 }
 
 //+------------------------------------------------------------------+
+//|                            RISK LADDER                            |
+//|                                                                   |
+//| Position size is decided by one number: how much cash this trade  |
+//| is allowed to lose. The ladder sets that number. The progression  |
+//| does not change expectancy - with independent trades no sizing    |
+//| rule can - it redistributes it, buying a higher chance of a small |
+//| winning day with a lower chance of a large losing one. The stops  |
+//| below are what keep that trade honest.                            |
+//+------------------------------------------------------------------+
+void LadderResetDay()
+{
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   ladderBaseCash = eq * InpLadderBasePct / 100.0;
+   ladderRiskCash = ladderBaseCash;
+   ladderLosses   = 0;
+   ladderDayPnl   = 0.0;
+   ladderScanFrom = TimeCurrent();
+
+   if(ladderPeakEq <= 0.0)
+      ladderPeakEq = eq;
+
+   if(InpLadderEnable && InpVerbose)
+      PrintFormat("Ladder day reset - equity=%.2f base=%.2f cap=%.2f",
+                  eq, ladderBaseCash, eq * InpLadderMaxPct / 100.0);
+}
+
+//+------------------------------------------------------------------+
+//| Peak-to-trough drawdown on equity. Measured on every tick because |
+//| a drawdown is a fact about the account, not about bar closes.     |
+//| The freeze is one-way within a run: once the account has been     |
+//| 25% down, the progression stays off until it makes a new high.    |
+//+------------------------------------------------------------------+
+void LadderTrackDrawdown()
+{
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq > ladderPeakEq)
+      ladderPeakEq = eq;
+
+   if(InpLadderMaxDDPct <= 0.0 || ladderPeakEq <= 0.0)
+      return;
+
+   double dd = (ladderPeakEq - eq) / ladderPeakEq * 100.0;
+
+   if(!ladderDDFreeze && dd >= InpLadderMaxDDPct)
+   {
+      ladderDDFreeze = true;
+      ladderRiskCash = ladderBaseCash;
+      ladderLosses   = 0;
+      PrintFormat("Ladder DD freeze at %.2f%% (peak=%.2f equity=%.2f) - base risk only.",
+                  dd, ladderPeakEq, eq);
+   }
+   else if(ladderDDFreeze && eq >= ladderPeakEq)
+   {
+      ladderDDFreeze = false;
+      Print("Ladder DD freeze cleared - equity back at the high-water mark.");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Advance the ladder from closed deals. Polled rather than driven   |
+//| from OnTrade so it is identical in the tester and live, and so a  |
+//| stop filled while the EA was detached is still counted.           |
+//|                                                                   |
+//| A deal's result is profit + commission + swap: sizing off gross   |
+//| profit would let a trade that paid its costs and nothing else     |
+//| count as a win.                                                   |
+//+------------------------------------------------------------------+
+void LadderPoll()
+{
+   if(!HistorySelect(ladderScanFrom, TimeCurrent() + 86400))
+      return;
+
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0 || ticket <= ladderLastDeal)
+         continue;
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != InpMagic)
+         continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol)
+         continue;
+
+      long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT && entry != DEAL_ENTRY_OUT_BY)
+         continue;
+
+      ladderLastDeal = ticket;
+
+      double net = HistoryDealGetDouble(ticket, DEAL_PROFIT)
+                 + HistoryDealGetDouble(ticket, DEAL_COMMISSION)
+                 + HistoryDealGetDouble(ticket, DEAL_SWAP);
+
+      ladderDayPnl += net;
+
+      if(net > InpLadderScratchCcy)
+      {
+         // Any win resets the whole progression. Not a partial step back -
+         // the point of the ladder is that one win ends the sequence.
+         ladderRiskCash = ladderBaseCash;
+         ladderLosses   = 0;
+      }
+      else if(net < -InpLadderScratchCcy)
+      {
+         ladderLosses++;
+         if(!ladderDDFreeze)
+            ladderRiskCash *= InpLadderMult;
+      }
+      // Inside the dead band: a scratch. The ladder holds where it is.
+
+      if(InpVerbose)
+         PrintFormat("Ladder: deal #%I64u net=%.2f -> next risk=%.2f consec_losses=%d day_pnl=%.2f",
+                     ticket, net, LadderRiskForTrade(), ladderLosses, ladderDayPnl);
+   }
+
+   LadderCheckStops();
+}
+
+//+------------------------------------------------------------------+
+//| The two daily stops. Both are checked after every closed deal, so |
+//| the halt lands before the next entry slot rather than after it.   |
+//+------------------------------------------------------------------+
+void LadderCheckStops()
+{
+   if(haltedToday)
+      return;
+
+   if(InpLadderMaxLosses > 0 && ladderLosses >= InpLadderMaxLosses)
+   {
+      haltedToday = true;
+      CloseAll("ladder consecutive-loss stop");
+      PrintFormat("Ladder stop: %d consecutive losses - flat for the rest of the day.",
+                  ladderLosses);
+      return;
+   }
+
+   if(InpLadderDayLossPct > 0.0 && dayStartEquity > 0.0)
+   {
+      double limit = dayStartEquity * InpLadderDayLossPct / 100.0;
+      if(ladderDayPnl <= -limit)
+      {
+         haltedToday = true;
+         CloseAll("ladder daily loss stop");
+         PrintFormat("Ladder stop: day P/L %.2f breached the %.2f limit - flat for the day.",
+                     ladderDayPnl, limit);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| The cash this trade may lose, after the per-trade cap. The cap is |
+//| struck against LIVE equity, not day-start equity, so a day that   |
+//| has already lost ground cannot keep sizing off the morning's      |
+//| balance.                                                          |
+//+------------------------------------------------------------------+
+double LadderRiskForTrade()
+{
+   double eq   = AccountInfoDouble(ACCOUNT_EQUITY);
+   double risk = ladderDDFreeze ? ladderBaseCash : ladderRiskCash;
+
+   if(InpLadderMaxPct > 0.0)
+   {
+      double cap = eq * InpLadderMaxPct / 100.0;
+      if(risk > cap)
+         risk = cap;
+   }
+
+   return(risk > 0.0 ? risk : 0.0);
+}
+
+//+------------------------------------------------------------------+
 //| Lots such that stopDist dollars-per-ounce costs InpRiskPct of     |
 //| equity. Derived from tick value so it holds for any XAU contract. |
 //+------------------------------------------------------------------+
@@ -607,7 +864,8 @@ double LotsForRisk(const double stopDist)
       return(0.0);
 
    double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
-   double riskCash = equity * InpRiskPct / 100.0;
+   double riskCash = InpLadderEnable ? LadderRiskForTrade()
+                                     : equity * InpRiskPct / 100.0;
    double lots     = riskCash / lossPerLot;
 
    return(ClampLots(lots));
@@ -862,6 +1120,8 @@ void ResetDay()
    dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    tradesToday     = 0;
    haltedToday     = false;
+
+   LadderResetDay();
 }
 
 //+------------------------------------------------------------------+
