@@ -176,7 +176,7 @@ datetime lastBarTime = 0;
 long   curWinId   = -1;
 double curWinOpen = 0.0;
 
-// Diagnostics — a strategy that takes no trades must be able to say why.
+// Diagnostics - a strategy that takes no trades must be able to say why.
 int signalBars    = 0;   // bars that reached the entry slot
 int rejGovernor   = 0;   // halted / max trades / out of session
 int rejNoAtr      = 0;   // ATR not ready
@@ -278,7 +278,7 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
    }
    if(InpFtmoEnable && InpFtmoDailyPct >= InpFtmoMaxPct)
-      Print("Warning: daily limit is not below the overall limit — one day can end the account.");
+      Print("Warning: daily limit is not below the overall limit - one day can end the account.");
 
    // Anchored once, for the life of the run: the overall limit is measured from
    // the account's original balance, so it must not move with deposits or with
@@ -295,7 +295,7 @@ int OnInit()
                   InpFtmoResetHr);
 
    // If this line is absent from the Journal, the EA never started and nothing
-   // below it ran — that is a setup problem, not a signal problem.
+   // below it ran - that is a setup problem, not a signal problem.
    if(InpLadderEnable)
    {
       if(InpUseFixedLot)
@@ -393,7 +393,7 @@ void OnDeinit(const int reason)
 
    PrintFunnel("final");
    if(signalBars == 0)
-      Print("    No bars reached the entry slot — check that the tester has M1 history and the chart is M1.");
+      Print("    No bars reached the entry slot - check that the tester has M1 history and the chart is M1.");
    else if(entriesSent == 0)
       Print("    Entry slots were reached but every one was filtered. The largest counter above is the cause.");
 }
@@ -1227,7 +1227,7 @@ void RollDay()
       {
          haltedToday = true;
          CloseAll("daily loss stop");
-         PrintFormat("Daily loss stop hit (%.2f%%) — flat for the rest of the day.", pnlPct);
+         PrintFormat("Daily loss stop hit (%.2f%%) - flat for the rest of the day.", pnlPct);
       }
    }
 }
