@@ -50,7 +50,7 @@
 //|  same step and can never forget a losing streak or double count.   |
 //+------------------------------------------------------------------+
 #property copyright "Built for Ahmad Mansour"
-#property version   "1.20"
+#property version   "1.21"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -98,7 +98,7 @@ input bool   InpUseTarget        = true;  // Use a fixed take-profit (MT5 port d
 input double InpTargetR          = 2.0;   // Target in R multiples - 2.0 = 1:2 risk:reward
 
 input group "--- Risk ladder (loss-recovery progression) ---"
-input double InpBaseRiskPct       = 2.0;   // Base risk (% of DAY-START equity), recalculated daily
+input double InpBaseRiskPct       = 1.0;   // Base risk (% of DAY-START equity), recalculated daily
 input double InpLossMultiplier    = 1.5;   // Risk multiplier after each consecutive loss
 input double InpMaxRiskPct        = 5.0;   // Hard cap: risk never exceeds this % of CURRENT equity
 input double InpDailyLossLimitPct = 2.0;   // Stand down for the day at this cumulative loss %
@@ -110,6 +110,12 @@ input int    InpMaxConsecLosses   = 5;     // Stand down for the day after this 
 // from what the ladder actually costs - sum of base x mult^i, each capped by
 // InpMaxRiskPct - so both stops bind at the same point. Off uses the literal
 // InpDailyLossLimitPct above, and init says which stop wins.
+//
+// At a 1% base the five rungs are 1, 1.5, 2.25, 3.375 and a capped 5, costing
+// 13.12% of equity - so the drawdown breaker absorbs 1.9 such days. Doubling
+// the base to 2% does not double that, it reaches 19.5%, because the cap
+// swallows the difference; what it does halve is the room to be wrong twice,
+// and the breaker is sticky once tripped.
 input bool   InpAutoDayLimit      = true;  // Derive the daily limit from the ladder depth
 input int    InpMaxTradesPerDay   = 20;    // Hard cap on entries per day
 
