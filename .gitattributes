@@ -1,0 +1,5 @@
+# MetaEditor mis-parses LF-only sources on Windows: the tokenizer loses its
+# place and reports errors at positions that hold no code - a blank line, or
+# line 1 column 1. Force CRLF on checkout so a clone is compilable as-is.
+*.mq5 text eol=crlf
+*.mqh text eol=crlf
