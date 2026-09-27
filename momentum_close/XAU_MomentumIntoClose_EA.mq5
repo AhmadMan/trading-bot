@@ -1,0 +1,778 @@
+//+------------------------------------------------------------------+
+//|                                   XAU_MomentumIntoClose_EA.mq5   |
+//|                                                                  |
+//|  Port of the "XAU Momentum Into Close" Pine backtest, merged     |
+//|  with the martingale-style recovery-risk system.                 |
+//|                                                                  |
+//|   ENTRY                                                          |
+//|    * The clock is cut into fixed windows, anchored to the epoch   |
+//|      so they line up with :00/:05/... regardless of session.      |
+//|    * With N minutes left in the window, measure the move from the |
+//|      window's open. If it clears the threshold AND the signal     |
+//|      bar's close agrees AND the body is big enough, that is the   |
+//|      signal - evaluated ONCE per window, on a confirmed close.    |
+//|                                                                  |
+//|   EXIT                                                            |
+//|    * Protective SL at entry, TP at a fixed R multiple.            |
+//|    * Optional flatten at the window boundary, with a RUNNER rule  |
+//|      that lets an already-winning trade survive it - see below.   |
+//|                                                                  |
+//|   RISK                                                            |
+//|    * BaseRisk = day-start equity x InpBaseRiskPct.                |
+//|    * After a loss: risk x InpLossMultiplier. After a win: reset.  |
+//|    * Hard cap at InpMaxRiskPct of CURRENT equity, a daily circuit |
+//|      breaker, and an account drawdown breaker that persists.      |
+//|                                                                  |
+//|  The ladder step is rebuilt from today's CLOSED DEALS every tick,  |
+//|  not carried in a plain variable - a restart mid-day replays the   |
+//|  same step and can never forget a losing streak or double count.   |
+//+------------------------------------------------------------------+
+#property copyright "Built for Ahmad Mansour"
+#property version   "1.10"
+#property strict
+
+#include <Trade/Trade.mqh>
+
+//============================ INPUTS ================================
+enum ENUM_MOVE_MODE { MOVE_USD, MOVE_ATR };
+enum ENUM_STOP_MODE { STOP_USD, STOP_ATR };
+
+input group "--- Window clock ---"
+input int    InpWindowMin        = 5;     // Window length (minutes) - must divide evenly by the chart TF
+input int    InpEntryLeadMin     = 2;     // Enter with N minutes left in the window
+input bool   InpCloseAtWindowEnd = true;  // Flatten at the window boundary (the Pine premise)
+
+input group "--- Runner: let a winner survive the window close ---"
+// The window close is the strategy's premise, but it is also a guillotine: a
+// trade that is running is cut at the same clock tick as one that is not. This
+// keeps the guillotine for everything that has NOT proved itself, and lets the
+// rest run on a trailing stop instead. Losers still die on the clock; only a
+// trade already past InpRunnerMinR is allowed to see the next window.
+//
+// The take-profit is REMOVED when a trade is promoted. A runner capped at
+// InpTargetR is not a runner - the cap is the thing being traded away, in
+// exchange for giving back part of the best price when the move ends.
+input bool   InpAllowRunner      = true;  // Let a qualifying winner past the window boundary
+input double InpRunnerMinR       = 1.0;   // Only run a trade already this many R in profit
+input double InpRunnerTrailAtr   = 1.5;   // Trail the stop this far behind price (x ATR)
+input double InpRunnerKeepPct    = 50.0;  // Bank if it gives back to this % of its best profit
+input int    InpRunnerMaxMin     = 0;     // Hard cap on runner life (minutes), 0 = off
+
+input group "--- Entry / momentum filter ---"
+input ENUM_MOVE_MODE InpMoveMode = MOVE_ATR;  // Move threshold mode
+input double InpMoveThreshUSD    = 2.5;   // Min move from window open ($) - used when mode = USD
+input double InpMoveATRMult      = 1.5;   // Min move (ATR multiples) - used when mode = ATR
+input int    InpATRPeriod        = 14;    // ATR length
+input bool   InpRequireAlign     = true;  // Signal bar must close with the move
+input double InpMinBodyPct       = 40.0;  // Min signal-bar body (% of range)
+input bool   InpAllowLong        = true;
+input bool   InpAllowShort       = true;
+input bool   InpAllowAdds        = false; // Pyramid same-direction signals while already in a trade
+
+input group "--- Exit ---"
+input ENUM_STOP_MODE InpStopMode = STOP_ATR;  // Stop mode
+input double InpStopUSD          = 3.0;   // Stop distance ($) - used when mode = USD
+input double InpStopATRMult      = 1.5;   // Stop distance (ATR mult) - used when mode = ATR
+input bool   InpUseTarget        = true;  // Use a fixed take-profit
+input double InpTargetR          = 2.0;   // Target in R multiples - 2.0 = 1:2 risk:reward
+
+input group "--- Risk ladder (loss-recovery progression) ---"
+input double InpBaseRiskPct       = 0.5;   // Base risk (% of DAY-START equity), recalculated daily
+input double InpLossMultiplier    = 1.5;   // Risk multiplier after each consecutive loss
+input double InpMaxRiskPct        = 5.0;   // Hard cap: risk never exceeds this % of CURRENT equity
+input double InpDailyLossLimitPct = 2.0;   // Stand down for the day at this cumulative loss %
+input int    InpMaxConsecLosses   = 3;     // Stand down for the day after this many losses in a row
+input int    InpMaxTradesPerDay   = 20;    // Hard cap on entries per day
+
+input group "--- Account drawdown breaker (persists across restarts) ---"
+input double InpMaxDrawdownPct = 25.0;   // Halt ALL trading if equity falls this % below its peak
+input bool   InpResetBreaker   = false;  // Set true + reapply inputs to clear a tripped breaker
+
+input group "--- Session filter (SERVER time, 24h) ---"
+input bool   InpUseSession       = false;
+input int    InpSessionStartHour = 8;
+input int    InpSessionEndHour   = 17;
+
+input group "--- Liquidity band (ATR $), 0 = off ---"
+input double InpMinATR = 0.0;
+input double InpMaxATR = 0.0;
+
+input group "--- Misc ---"
+input long   InpMagic    = 30952;
+input int    InpSlippage = 30;
+
+//============================ GLOBALS ===============================
+CTrade   trade;
+
+// One ATR handle for the life of the EA. Creating and releasing a handle on
+// every call works in the tester, where indicators are calculated
+// synchronously, and fails live: a handle created this tick has no data yet,
+// CopyBuffer returns -1, and ATR reads 0.0 forever. Every downstream test then
+// silently refuses to trade.
+int      g_atrHandle        = INVALID_HANDLE;
+
+datetime g_curDay           = 0;
+double   g_dayStartEquity   = 0.0;
+double   g_baseRiskMoney    = 0.0;
+int      g_tradesToday      = 0;
+bool     g_dayHalted        = false;
+
+int      g_ladderStep        = 0;     // consecutive losses since g_ladderResetTime, replayed each tick
+int      g_consecLossesToday = 0;     // consecutive losses today
+double   g_dailyLossMoney    = 0.0;
+
+double   g_peakEquity       = 0.0;
+bool     g_breakerTripped   = false;
+datetime g_ladderResetTime  = 0;      // ladder step only counts deals closed at/after this time
+
+datetime g_lastBarTime      = 0;
+long     g_lastWinId        = -1;
+double   g_windowOpen       = 0.0;
+
+// Runner state. g_runnerR is the ORIGINAL stop distance, captured at entry:
+// once the trail starts moving the stop, the distance from entry to stop no
+// longer describes the risk that was actually taken, so R has to be stored
+// rather than re-derived.
+bool     g_runnerActive     = false;
+double   g_runnerR          = 0.0;
+double   g_runnerPeak       = 0.0;    // best open profit seen while running
+datetime g_runnerSince      = 0;
+double   g_entryStopDist    = 0.0;    // stop distance of the live position
+
+string   g_status           = "starting";
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   int tfMin = (int)MathRound(PeriodSeconds() / 60.0);
+   if(PeriodSeconds() < 60 || PeriodSeconds() % 60 != 0)
+   {
+      Alert("Attach this EA to a whole-minute intraday chart (M1 recommended).");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   if(InpWindowMin % tfMin != 0)
+   {
+      Alert("Window length must be a whole multiple of the chart timeframe.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   if(InpEntryLeadMin >= InpWindowMin)
+   {
+      Alert("Entry lead must be shorter than the window.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   if(InpEntryLeadMin % tfMin != 0)
+   {
+      Alert(StringFormat("Entry lead must be a multiple of the chart timeframe (%d min).", tfMin));
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   g_atrHandle = iATR(_Symbol, _Period, InpATRPeriod);
+   if(g_atrHandle == INVALID_HANDLE)
+   {
+      Alert("Could not create the ATR handle.");
+      return(INIT_FAILED);
+   }
+
+   if(!TradingEnabled())
+      Print("WARNING: trading is not permitted right now (AutoTrading off, account "
+            "restriction, or symbol not tradable). The EA will wait.");
+
+   LoadBreakerState();
+   NewDayReset();
+   return(INIT_SUCCEEDED);
+}
+
+//| Peak equity + breaker + ladder-reset survive EA restarts           |
+string GVPeak()        { return(StringFormat("%s_%I64u_mic_peak",   _Symbol, InpMagic)); }
+string GVBreaker()     { return(StringFormat("%s_%I64u_mic_brk",    _Symbol, InpMagic)); }
+string GVLadderReset() { return(StringFormat("%s_%I64u_mic_ldrst",  _Symbol, InpMagic)); }
+
+void LoadBreakerState()
+{
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_peakEquity      = GlobalVariableCheck(GVPeak())        ? GlobalVariableGet(GVPeak())        : eq;
+   g_breakerTripped  = GlobalVariableCheck(GVBreaker())     ? (GlobalVariableGet(GVBreaker()) > 0.5) : false;
+   g_ladderResetTime = GlobalVariableCheck(GVLadderReset()) ? (datetime)GlobalVariableGet(GVLadderReset()) : 0;
+   if(eq > g_peakEquity) g_peakEquity = eq;
+
+   if(InpResetBreaker && g_breakerTripped)
+   {
+      g_breakerTripped  = false;
+      g_peakEquity      = eq;              // don't re-trip instantly off the old peak
+      g_ladderResetTime = TimeCurrent();   // resume at BaseRisk, not mid-ladder
+      Print("Drawdown breaker manually cleared via InpResetBreaker.");
+   }
+   SaveBreakerState();
+}
+
+void SaveBreakerState()
+{
+   GlobalVariableSet(GVPeak(),        g_peakEquity);
+   GlobalVariableSet(GVBreaker(),     g_breakerTripped ? 1.0 : 0.0);
+   GlobalVariableSet(GVLadderReset(), (double)g_ladderResetTime);
+}
+
+void OnDeinit(const int reason)
+{
+   if(g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+   Comment("");
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(DayStart(TimeCurrent()) != g_curDay) NewDayReset();
+
+   // ---- account drawdown breaker (whole-account, survives restarts) --
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity > g_peakEquity) { g_peakEquity = equity; SaveBreakerState(); }
+   double dd = (g_peakEquity > 0.0) ? (g_peakEquity - equity) / g_peakEquity : 0.0;
+
+   if(!g_breakerTripped && InpMaxDrawdownPct > 0.0 && dd >= InpMaxDrawdownPct / 100.0)
+   {
+      g_breakerTripped  = true;
+      g_ladderResetTime = TimeCurrent();
+      SaveBreakerState();
+      CloseAll();
+      PrintFormat("DRAWDOWN BREAKER TRIPPED at %.1f%% below peak (%.2f -> %.2f). "
+                  "Halted until InpResetBreaker is set true and inputs reapplied.",
+                  dd * 100.0, g_peakEquity, equity);
+   }
+   if(g_breakerTripped)
+   {
+      g_status = StringFormat("BREAKER TRIPPED (%.1f%% drawdown) - manual reset required", dd * 100.0);
+      Comment(g_status);
+      return;
+   }
+
+   // A runner is managed on every tick, not on the bar close: the whole point
+   // of it is to follow a move that is still happening.
+   ManageRunner();
+
+   UpdateLadderFromHistory();
+
+   if(!g_dayHalted)
+   {
+      if(g_consecLossesToday >= InpMaxConsecLosses)
+         { g_dayHalted = true; g_status = StringFormat("DAILY HALT - %d losses in a row", g_consecLossesToday); PrintFormat("%s", g_status); }
+      else if(InpDailyLossLimitPct > 0.0 && g_dailyLossMoney >= g_dayStartEquity * InpDailyLossLimitPct / 100.0)
+         { g_dayHalted = true; g_status = StringFormat("DAILY HALT - loss %.2f reached", g_dailyLossMoney); PrintFormat("%s", g_status); }
+   }
+
+   bool longSig = false, shortSig = false, lastBar = false;
+   bool newBar = RefreshWindowAndSignal(longSig, shortSig, lastBar);
+
+   if(newBar && lastBar && HasOpenPosition())
+      HandleWindowClose();
+
+   ShowPanel();
+
+   if(g_dayHalted)              return;
+   if(!newBar)                  return;
+   if(!(longSig || shortSig))   return;
+   if(InpUseSession && !InSession()) return;
+   if(g_tradesToday >= InpMaxTradesPerDay) return;
+
+   int haveDir = PositionDirection();
+   int wantDir = longSig ? 1 : -1;
+   if(haveDir != 0)
+   {
+      // A runner owns the position. A new signal must not add to it, reverse
+      // it, or reset its trail - the runner is a different trade now, being
+      // managed on different rules.
+      if(g_runnerActive)       return;
+      if(!InpAllowAdds)        return;
+      if(haveDir != wantDir)   return;
+   }
+
+   TryEnter(longSig, wantDir);
+}
+
+//+------------------------------------------------------------------+
+//| The window boundary. Everything that has not proved itself is cut |
+//| here exactly as before; a trade already past InpRunnerMinR is      |
+//| promoted instead and handed to the trail.                         |
+//+------------------------------------------------------------------+
+void HandleWindowClose()
+{
+   if(g_runnerActive)
+      return;                                   // already running, the trail owns it
+
+   if(!InpCloseAtWindowEnd)
+      return;                                   // boundary flattening is off entirely
+
+   if(!InpAllowRunner)
+   {
+      CloseAll();
+      return;
+   }
+
+   double rMult = OpenProfitR();
+   if(rMult < InpRunnerMinR)
+   {
+      CloseAll();
+      return;
+   }
+
+   PromoteToRunner(rMult);
+}
+
+//--- Open profit of the live position, expressed in R.
+double OpenProfitR()
+{
+   if(g_entryStopDist <= 0.0)
+      return(0.0);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+
+      double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      double cur  = PositionGetDouble(POSITION_PRICE_CURRENT);
+      double move = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                  ? cur - open : open - cur;
+      return(move / g_entryStopDist);
+   }
+   return(0.0);
+}
+
+//--- Strip the take-profit and start the trail. The TP has to go: a runner
+//--- capped at InpTargetR is just a normal trade with extra steps.
+void PromoteToRunner(const double rMult)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+
+      double sl = PositionGetDouble(POSITION_SL);
+      if(!trade.PositionModify(tk, sl, 0.0))
+      {
+         PrintFormat("Runner promote failed on %I64u: retcode %d - leaving the trade as it is.",
+                     tk, trade.ResultRetcode());
+         return;
+      }
+   }
+
+   g_runnerActive = true;
+   g_runnerR      = g_entryStopDist;
+   g_runnerPeak   = OpenProfitMoney();
+   g_runnerSince  = TimeCurrent();
+
+   PrintFormat("RUNNER: trade is %.2fR up at the window close - target removed, "
+               "trailing %.2f x ATR from here.", rMult, InpRunnerTrailAtr);
+}
+
+//--- Money profit of the live position, for the give-back rule.
+double OpenProfitMoney()
+{
+   double sum = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      sum += PositionGetDouble(POSITION_PROFIT)
+           + PositionGetDouble(POSITION_SWAP);
+   }
+   return(sum);
+}
+
+//+------------------------------------------------------------------+
+//| The runner's three ways to end: the trailing stop catches it, it  |
+//| gives back too much of its best, or it outlives its time cap.     |
+//| The broker-side stop is the one that actually fires - the others  |
+//| close at market - so an outage still ends the trade.              |
+//+------------------------------------------------------------------+
+void ManageRunner()
+{
+   if(!g_runnerActive)
+      return;
+
+   if(!HasOpenPosition())
+   {
+      // The trail, or a gap, already closed it.
+      g_runnerActive = false;
+      g_runnerPeak   = 0.0;
+      g_runnerR      = 0.0;
+      return;
+   }
+
+   double profit = OpenProfitMoney();
+   if(profit > g_runnerPeak)
+      g_runnerPeak = profit;
+
+   // Give-back: bank what is left rather than watch a winner round-trip.
+   if(InpRunnerKeepPct > 0.0 && g_runnerPeak > 0.0)
+   {
+      double floorProfit = g_runnerPeak * InpRunnerKeepPct / 100.0;
+      if(profit <= floorProfit)
+      {
+         CloseAll();
+         PrintFormat("RUNNER BANKED: %.2f of a best %.2f (floor %.0f%%).",
+                     profit, g_runnerPeak, InpRunnerKeepPct);
+         g_runnerActive = false;
+         return;
+      }
+   }
+
+   // Time cap.
+   if(InpRunnerMaxMin > 0 && TimeCurrent() - g_runnerSince >= InpRunnerMaxMin * 60)
+   {
+      CloseAll();
+      PrintFormat("RUNNER TIMED OUT after %d minutes at %.2f.", InpRunnerMaxMin, profit);
+      g_runnerActive = false;
+      return;
+   }
+
+   // Trail. Ratchets one way only - a stop that can loosen is not a stop.
+   double atr = ATR();
+   if(atr <= 0.0 || InpRunnerTrailAtr <= 0.0)
+      return;
+
+   double dist    = InpRunnerTrailAtr * atr;
+   double minDist = StopLevelPrice();
+   if(dist < minDist) dist = minDist;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+
+      bool   isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      double cur    = PositionGetDouble(POSITION_PRICE_CURRENT);
+      double sl     = PositionGetDouble(POSITION_SL);
+      double want   = NormalizeDouble(isLong ? cur - dist : cur + dist, _Digits);
+
+      if(isLong)
+      {
+         if(sl > 0.0 && want <= sl) continue;   // never loosen
+         if(cur - want < minDist)   continue;   // broker would reject it
+      }
+      else
+      {
+         if(sl > 0.0 && want >= sl) continue;
+         if(want - cur < minDist)   continue;
+      }
+
+      if(!trade.PositionModify(tk, want, 0.0))
+         PrintFormat("Runner trail failed on %I64u: retcode %d", tk, trade.ResultRetcode());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Window clock + signal - evaluated once per new, confirmed bar     |
+//+------------------------------------------------------------------+
+bool RefreshWindowAndSignal(bool &longSig, bool &shortSig, bool &lastBar)
+{
+   longSig = false; shortSig = false; lastBar = false;
+
+   datetime t0 = iTime(_Symbol, _Period, 0);
+   if(t0 == g_lastBarTime) return(false);      // no new bar yet
+   g_lastBarTime = t0;
+
+   datetime t = iTime(_Symbol, _Period, 1);    // the bar that just closed
+   if(t == 0) return(false);
+   double close1 = iClose(_Symbol, _Period, 1);
+   double open1  = iOpen(_Symbol, _Period, 1);
+   double high1  = iHigh(_Symbol, _Period, 1);
+   double low1   = iLow(_Symbol, _Period, 1);
+
+   int winSec = InpWindowMin * 60;
+   long winId = (long)(t / winSec);
+   if(winId != g_lastWinId) { g_windowOpen = open1; g_lastWinId = winId; }
+
+   int tfMin      = (int)MathRound(PeriodSeconds() / 60.0);
+   int secIntoWin = (int)(t % winSec);
+   int minsLeft   = InpWindowMin - (secIntoWin / 60) - tfMin;
+
+   bool isEntryBar = (minsLeft == InpEntryLeadMin);
+   lastBar = (minsLeft <= 0);
+
+   if(!isEntryBar || g_windowOpen <= 0.0) return(true);
+
+   double atr = ATR();
+   double move = close1 - g_windowOpen;
+   double threshold = (InpMoveMode == MOVE_ATR) ? atr * InpMoveATRMult : InpMoveThreshUSD;
+
+   double barRange = high1 - low1;
+   double bodyPct  = (barRange > 0.0) ? MathAbs(close1 - open1) / barRange * 100.0 : 0.0;
+   bool   barUp    = close1 > open1;
+   bool   barDown  = close1 < open1;
+   bool   alignedUp   = !InpRequireAlign || barUp;
+   bool   alignedDown = !InpRequireAlign || barDown;
+   bool   bodyOk      = bodyPct >= InpMinBodyPct;
+   bool   liquidityOk = (atr > 0.0) &&
+                        (InpMinATR <= 0.0 || atr >= InpMinATR) &&
+                        (InpMaxATR <= 0.0 || atr <= InpMaxATR);
+
+   longSig  = InpAllowLong  && move >=  threshold && alignedUp   && bodyOk && liquidityOk;
+   shortSig = InpAllowShort && move <= -threshold && alignedDown && bodyOk && liquidityOk;
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Sizing + order placement                                          |
+//+------------------------------------------------------------------+
+void TryEnter(bool isLong, int dir)
+{
+   double atr = ATR();
+   double stopDist = (InpStopMode == STOP_ATR) ? atr * InpStopATRMult : InpStopUSD;
+   if(stopDist <= StopLevelPrice())
+   {
+      g_status = "stop distance inside broker stop level - skipped";
+      return;
+   }
+
+   double maxRiskMoney = AccountInfoDouble(ACCOUNT_EQUITY) * InpMaxRiskPct / 100.0;
+   double riskMoney    = MathMin(g_baseRiskMoney * MathPow(InpLossMultiplier, g_ladderStep), maxRiskMoney);
+
+   double lots = LotForRisk(stopDist, riskMoney, maxRiskMoney);
+   if(lots <= 0.0)
+   {
+      g_status = "risk too small for min lot - skipped";
+      return;
+   }
+
+   double price = isLong ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double sl = NormalizeDouble(isLong ? price - stopDist : price + stopDist, _Digits);
+   double tp = InpUseTarget
+             ? NormalizeDouble(isLong ? price + stopDist * InpTargetR : price - stopDist * InpTargetR, _Digits)
+             : 0.0;
+
+   bool ok = isLong ? trade.Buy(lots, _Symbol, 0.0, sl, tp, "MIC")
+                     : trade.Sell(lots, _Symbol, 0.0, sl, tp, "MIC");
+   if(ok)
+   {
+      g_tradesToday++;
+      g_entryStopDist = stopDist;               // the R this trade is measured in
+      PrintFormat("%s lots %.2f  risk %.2f (step %d)  SL %.2f  TP %.2f",
+                  isLong ? "BUY" : "SELL", lots, riskMoney, g_ladderStep, sl, tp);
+   }
+}
+
+//| Lot that risks exactly riskMoney over stopDist, capped by maxRiskMoney |
+double LotForRisk(double stopDist, double riskMoney, double maxRiskMoney)
+{
+   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0.0 || tickVal <= 0.0 || stopDist <= 0.0 || riskMoney <= 0.0) return(0.0);
+
+   double lots = riskMoney / ((stopDist / tickSize) * tickVal);
+   lots = NormalizeLots(lots);
+
+   // guard the classic "rounds down to zero on a high priced symbol" trap
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   if(lots < minLot)
+   {
+      double minRisk = minLot * (stopDist / tickSize) * tickVal;
+      if(minRisk > maxRiskMoney) return(0.0);   // even the min lot would blow the hard cap
+      lots = minLot;
+   }
+   return(lots);
+}
+
+double NormalizeLots(double lots)
+{
+   double mn = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double mx = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double st = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(st <= 0.0) st = 0.01;
+   lots = MathFloor(lots / st + 0.0000001) * st;
+   lots = MathMax(mn, MathMin(mx, lots));
+   return(NormalizeDouble(lots, 2));
+}
+
+//+------------------------------------------------------------------+
+//| Daily math + ladder replay                                        |
+//+------------------------------------------------------------------+
+void NewDayReset()
+{
+   g_curDay         = DayStart(TimeCurrent());
+   g_dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_baseRiskMoney  = g_dayStartEquity * InpBaseRiskPct / 100.0;
+   g_tradesToday    = 0;
+   g_dayHalted      = false;
+   g_lastWinId      = -1;
+   g_windowOpen     = 0.0;
+   if(g_ladderResetTime < g_curDay) g_ladderResetTime = g_curDay;
+
+   PrintFormat("NEW DAY %s  start=%.2f  base risk=%.2f",
+               TimeToString(g_curDay, TIME_DATE), g_dayStartEquity, g_baseRiskMoney);
+}
+
+//| Rebuilt from CLOSED DEALS each tick, not carried in a variable -    |
+//| a restart mid-day replays today's history and lands on the same    |
+//| step, so it can never forget a losing streak or double-count one.  |
+//| Deals are matched on MAGIC alone: a broker is free to rewrite or    |
+//| append to an order comment, so filtering on it drops real closes    |
+//| live while passing every one of them in the tester.                |
+void UpdateLadderFromHistory()
+{
+   g_ladderStep        = 0;
+   g_consecLossesToday = 0;
+   g_dailyLossMoney    = 0.0;
+   if(!HistorySelect(g_curDay, TimeCurrent() + 60)) return;
+
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)   // oldest first
+   {
+      ulong d = HistoryDealGetTicket(i);
+      if(d == 0) continue;
+      if(HistoryDealGetString(d, DEAL_SYMBOL) != _Symbol) continue;
+      if(HistoryDealGetInteger(d, DEAL_MAGIC) != InpMagic) continue;
+      if(HistoryDealGetInteger(d, DEAL_ENTRY) == DEAL_ENTRY_IN) continue;   // only closes
+
+      double net = HistoryDealGetDouble(d, DEAL_PROFIT)
+                 + HistoryDealGetDouble(d, DEAL_SWAP)
+                 + HistoryDealGetDouble(d, DEAL_COMMISSION);
+      datetime dt = (datetime)HistoryDealGetInteger(d, DEAL_TIME);
+
+      if(net > 0.0)
+      {
+         g_consecLossesToday = 0;
+         if(dt >= g_ladderResetTime) g_ladderStep = 0;
+      }
+      else
+      {
+         g_dailyLossMoney += MathAbs(net);
+         g_consecLossesToday++;
+         if(dt >= g_ladderResetTime) g_ladderStep++;
+      }
+   }
+}
+
+datetime DayStart(datetime t)
+{
+   MqlDateTime d; TimeToStruct(t, d);
+   d.hour = 0; d.min = 0; d.sec = 0;
+   return(StructToTime(d));
+}
+
+//+------------------------------------------------------------------+
+//| Small helpers                                                      |
+//+------------------------------------------------------------------+
+//| One shared handle, created in OnInit. Creating one per call is the |
+//| classic tester-only bug: live, a fresh handle has no data on the   |
+//| tick it is made, CopyBuffer fails, and this returns 0.0 forever.   |
+double ATR()
+{
+   if(g_atrHandle == INVALID_HANDLE) return(0.0);
+   double buf[];
+   if(CopyBuffer(g_atrHandle, 0, 1, 1, buf) != 1) return(0.0);
+   return(buf[0]);
+}
+
+bool TradingEnabled()
+{
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))           return(false);
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return(false);
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))   return(false);
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))    return(false);
+   return(true);
+}
+
+bool InSession()
+{
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   if(InpSessionStartHour <= InpSessionEndHour)
+      return(dt.hour >= InpSessionStartHour && dt.hour < InpSessionEndHour);
+   return(dt.hour >= InpSessionStartHour || dt.hour < InpSessionEndHour);   // overnight wrap
+}
+
+int PositionDirection()   // +1 long, -1 short, 0 flat (this EA's magic on this symbol)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      return(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 1 : -1);
+   }
+   return(0);
+}
+
+bool HasOpenPosition() { return(PositionDirection() != 0); }
+
+void CloseAll()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      trade.PositionClose(tk);
+   }
+   g_runnerActive = false;
+   g_runnerPeak   = 0.0;
+}
+
+double StopLevelPrice()
+{
+   return((double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point);
+}
+
+void ShowPanel()
+{
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double dd = (g_peakEquity > 0.0) ? (g_peakEquity - equity) / g_peakEquity * 100.0 : 0.0;
+   double nextRisk = MathMin(g_baseRiskMoney * MathPow(InpLossMultiplier, g_ladderStep),
+                              equity * InpMaxRiskPct / 100.0);
+
+   string runnerTxt = "off";
+   if(InpAllowRunner)
+      runnerTxt = g_runnerActive
+                ? StringFormat("RUNNING - now %.2f, best %.2f, floor %.2f",
+                               OpenProfitMoney(), g_runnerPeak,
+                               g_runnerPeak * InpRunnerKeepPct / 100.0)
+                : StringFormat("armed - needs %.2fR at the window close (now %.2fR)",
+                               InpRunnerMinR, OpenProfitR());
+
+   Comment(StringFormat(
+      "XAU Momentum-Into-Close EA\n"
+      "-----------------------------------\n"
+      "Day start equity  : %.2f\n"
+      "Base risk / day    : %.2f\n"
+      "Ladder step / next : %d / %.2f\n"
+      "Trades today       : %d / %d\n"
+      "Consec losses      : %d / %d\n"
+      "Daily loss used     : %.2f / %.2f\n"
+      "Drawdown vs peak    : %.1f%% / %.1f%%\n"
+      "Runner              : %s\n"
+      "Status              : %s",
+      g_dayStartEquity, g_baseRiskMoney,
+      g_ladderStep, nextRisk,
+      g_tradesToday, InpMaxTradesPerDay,
+      g_consecLossesToday, InpMaxConsecLosses,
+      g_dailyLossMoney, g_dayStartEquity * InpDailyLossLimitPct / 100.0,
+      dd, InpMaxDrawdownPct,
+      runnerTxt,
+      g_dayHalted ? "DAILY HALT" : g_status
+   ));
+}
+
+//| Optimiser score: profit factor * recovery factor, >= 30 trades      |
+double OnTester()
+{
+   double trades = TesterStatistics(STAT_TRADES);
+   if(trades < 30) return(0.0);
+   double pf = TesterStatistics(STAT_PROFIT_FACTOR);
+   double rf = TesterStatistics(STAT_RECOVERY_FACTOR);
+   if(pf <= 0.0 || rf <= 0.0) return(0.0);
+   return(pf * rf);
+}
+//+------------------------------------------------------------------+
