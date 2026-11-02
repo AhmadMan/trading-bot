@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-10-31 01:35:09.404143+00:00",
+  "updated_at": "2026-11-02 14:55:12.797835+00:00",
   "signals": [
     {
       "layer": "gold_swing",
@@ -947,46 +947,38 @@
   "news": {
     "events": [
       {
-        "title": "Federal Funds Rate",
+        "title": "Congressional Elections",
         "currency": "USD",
-        "time": "2026-10-28 18:00:00+00:00",
-        "forecast": "4.00%",
-        "previous": "4.00%",
-        "actual": null
-      },
-      {
-        "title": "FOMC Statement",
-        "currency": "USD",
-        "time": "2026-10-28 18:00:00+00:00",
+        "time": "2026-11-03 15:16:00+00:00",
         "forecast": "",
         "previous": "",
         "actual": null
       },
       {
-        "title": "FOMC Press Conference",
+        "title": "Average Hourly Earnings m/m",
         "currency": "USD",
-        "time": "2026-10-28 18:30:00+00:00",
-        "forecast": "",
-        "previous": "",
-        "actual": null
-      },
-      {
-        "title": "Advance GDP q/q",
-        "currency": "USD",
-        "time": "2026-10-29 12:30:00+00:00",
-        "forecast": "3.2%",
-        "previous": "1.5%",
-        "actual": null
-      },
-      {
-        "title": "Core PCE Price Index m/m",
-        "currency": "USD",
-        "time": "2026-10-29 12:30:00+00:00",
+        "time": "2026-11-06 13:30:00+00:00",
         "forecast": "0.3%",
-        "previous": "0.2%",
+        "previous": "0.1%",
+        "actual": null
+      },
+      {
+        "title": "Non-Farm Employment Change",
+        "currency": "USD",
+        "time": "2026-11-06 13:30:00+00:00",
+        "forecast": "63K",
+        "previous": "29K",
+        "actual": null
+      },
+      {
+        "title": "Unemployment Rate",
+        "currency": "USD",
+        "time": "2026-11-06 13:30:00+00:00",
+        "forecast": "4.2%",
+        "previous": "4.2%",
         "actual": null
       }
     ],
-    "updated_at": "2026-10-31 01:35:09.404101+00:00"
+    "updated_at": "2026-11-02 14:55:12.797801+00:00"
   }
 }
