@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-11-07 00:30:24.287202+00:00",
+  "updated_at": "2026-11-09 15:23:17.288238+00:00",
   "signals": [
     {
       "layer": "gold_swing",
@@ -1009,38 +1009,38 @@
   "news": {
     "events": [
       {
-        "title": "Congressional Elections",
+        "title": "Core CPI m/m",
         "currency": "USD",
-        "time": "2026-11-03 15:16:00+00:00",
-        "forecast": "",
-        "previous": "",
+        "time": "2026-11-10 13:30:00+00:00",
+        "forecast": "0.2%",
+        "previous": "0.3%",
         "actual": null
       },
       {
-        "title": "Average Hourly Earnings m/m",
+        "title": "CPI m/m",
         "currency": "USD",
-        "time": "2026-11-06 13:30:00+00:00",
+        "time": "2026-11-10 13:30:00+00:00",
         "forecast": "0.3%",
-        "previous": "0.1%",
+        "previous": "0.6%",
         "actual": null
       },
       {
-        "title": "Non-Farm Employment Change",
+        "title": "Core PPI m/m",
         "currency": "USD",
-        "time": "2026-11-06 13:30:00+00:00",
-        "forecast": "65K",
-        "previous": "29K",
+        "time": "2026-11-13 13:30:00+00:00",
+        "forecast": "0.3%",
+        "previous": "0.7%",
         "actual": null
       },
       {
-        "title": "Unemployment Rate",
+        "title": "PPI m/m",
         "currency": "USD",
-        "time": "2026-11-06 13:30:00+00:00",
-        "forecast": "4.2%",
-        "previous": "4.2%",
+        "time": "2026-11-13 13:30:00+00:00",
+        "forecast": "0.4%",
+        "previous": "1.3%",
         "actual": null
       }
     ],
-    "updated_at": "2026-11-07 00:04:11.800226+00:00"
+    "updated_at": "2026-11-09 15:23:17.288210+00:00"
   }
 }
