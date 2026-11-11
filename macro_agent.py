@@ -1,17 +1,16 @@
 """
 Macro Agent — pipeline step 2.
 
-Gathers real, current macro context that price data + Ollama's training
+Gathers real, current macro context that price data + model training
 knowledge alone can't provide: central bank stances, analyst views on DXY,
 risk sentiment (VIX), and the upcoming high-impact economic calendar.
 
-Two-model pattern (ported from the Cloudflare Worker version of this idea):
+Two-pass Gemini pattern:
   1. Gemini, with Google Search grounding, gathers a live factual data brief
      (numbers + dates only, no analysis).
-  2. Ollama (the model used everywhere else in this system) turns that brief
-     into a short professional synthesis, so downstream agents (Forecast,
-     Council, Daily Brief) get real current context instead of stale
-     training-data assumptions.
+  2. Gemini again turns that brief into a short professional synthesis, so
+     downstream steps (Gold Bias, Daily Brief) get real current context
+     instead of stale training-data assumptions.
 
 COT is deliberately NOT requested here — cot_agent.py already covers that
 from the official CFTC API (with insider-week as fallback), so asking Gemini
@@ -19,26 +18,11 @@ to search for it too would be redundant and less reliable.
 """
 
 import json
-import time
 from pathlib import Path
 
-import requests
 import pandas as pd
 
-from config import GEMINI_API_KEY, GEMINI_MODEL, OLLAMA_URL, OLLAMA_MODEL, OLLAMA_KEY
-
-# google-genai SDK (Interactions API). Client auto-reads GEMINI_API_KEY /
-# GOOGLE_API_KEY from the env. Lazily constructed so a run with no key set
-# (macro is an optional step) doesn't import-fail.
-_genai_client = None
-
-
-def _gemini_client():
-    global _genai_client
-    if _genai_client is None:
-        from google import genai
-        _genai_client = genai.Client()
-    return _genai_client
+from config import GEMINI_API_KEY, gemini_text
 
 DATA_ROOT   = Path(__file__).parent / "data"
 LATEST_FILE = DATA_ROOT / "macro_latest.json"
@@ -74,39 +58,15 @@ USD bias and why, the single biggest near-term risk/catalyst, and a one-line rea
 
 
 def fetch_live_macro_data() -> str:
-    if not GEMINI_API_KEY:
-        return ""
-    try:
-        interaction = _gemini_client().interactions.create(
-            model=GEMINI_MODEL,
-            input=GEMINI_DATA_PROMPT,
-            tools=[{"type": "google_search"}],
-        )
-        return (interaction.output_text or "").strip()
-    except Exception as e:
-        print(f"  [Gemini] failed: {e}")
-        return ""
+    # Pass 1 — Google-Search-grounded factual gather (numbers + dates, no analysis).
+    return gemini_text("", GEMINI_DATA_PROMPT, search=True)
 
 
 def synthesize_macro_view(live_data: str) -> str:
+    # Pass 2 — turn the factual brief into a short professional synthesis.
     if not live_data:
         return ""
-    for attempt in range(2):
-        try:
-            r = requests.post(OLLAMA_URL,
-                              headers={"Authorization": f"Bearer {OLLAMA_KEY}",
-                                       "Content-Type": "application/json"},
-                              json={"model": OLLAMA_MODEL, "stream": False,
-                                    "options": {"temperature": 0.3, "num_predict": 600},
-                                    "messages": [{"role": "system", "content": MACRO_SYNTHESIS_SYSTEM},
-                                                 {"role": "user",   "content": live_data[:6000]}]},
-                              timeout=90)
-            if r.ok:
-                return r.json()["message"]["content"].strip()
-        except Exception:
-            pass
-        time.sleep(2)
-    return ""
+    return gemini_text(MACRO_SYNTHESIS_SYSTEM, live_data[:6000])
 
 
 def run_macro_agent() -> dict:

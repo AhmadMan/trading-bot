@@ -21,14 +21,47 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_URL     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
 TWELVEDATA_KEY   = os.environ.get("TWELVEDATA_KEY", "")
-OLLAMA_KEY       = os.environ.get("OLLAMA_API_KEY", "")
-OLLAMA_URL       = "https://ollama.com/api/chat"
-OLLAMA_MODEL     = "gpt-oss:20b-cloud"
 
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
-# Used via the google-genai SDK (Interactions API) in macro_agent.py — no raw
-# REST URL needed anymore. genai.Client() reads GEMINI_API_KEY from the env.
+# All LLM text — macro synthesis, signal reasoning, the Arabic executive
+# summary — now runs through the google-genai SDK (Interactions API) via
+# gemini_text() below. One model, one key; the old Ollama Cloud endpoint was
+# removed. genai.Client() reads GEMINI_API_KEY / GOOGLE_API_KEY from the env.
 GEMINI_MODEL     = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
+
+
+# ── Gemini text helper (shared LLM synthesis) ─────────────────────────────────
+# Lazily-built single client, reused by gold_engine (signal reasoning),
+# macro_agent (macro synthesis) and daily_brief (Arabic summary). Mirrors the
+# proven interactions.create(model=, input=) call already used for the
+# Google-Search-grounded macro gather.
+_genai_client = None
+
+
+def _gemini_client():
+    global _genai_client
+    if _genai_client is None:
+        from google import genai
+        _genai_client = genai.Client()  # reads GEMINI_API_KEY / GOOGLE_API_KEY
+    return _genai_client
+
+
+def gemini_text(system: str, user: str, *, search: bool = False) -> str:
+    """Free-form text synthesis via Gemini. Returns the stripped output, or ""
+    on any failure (every caller supplies its own fallback). `system` is folded
+    into the single `input` string the Interactions API expects."""
+    if not GEMINI_API_KEY:
+        return ""
+    prompt = f"{system.strip()}\n\n{user.strip()}" if system else user
+    kwargs = {"model": GEMINI_MODEL, "input": prompt}
+    if search:
+        kwargs["tools"] = [{"type": "google_search"}]
+    try:
+        interaction = _gemini_client().interactions.create(**kwargs)
+        return (interaction.output_text or "").strip()
+    except Exception as e:
+        print(f"  [Gemini] text synthesis failed: {e}")
+        return ""
 
 # GitHub Pages URL for the dashboard (repo made public, Pages serving /docs).
 # Override via env var if you host it elsewhere (Cloudflare Pages, Vercel, a

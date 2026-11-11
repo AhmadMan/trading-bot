@@ -38,7 +38,7 @@ COT  →  Macro (Gemini)  →  Gold Bias  →  Gold Scalp  →  Gold Swing  → 
 | # | Step | What it does |
 |---|---|---|
 | 1 | `cot_agent.py` | Official CFTC gold positioning (insider-week.com fallback). Cached 180 min. Read as an additive input downstream, never a veto. |
-| 2 | `macro_agent.py` | Gemini (Google Search grounded) gathers a live factual brief — Fed stance, DXY/yields, risk sentiment, next 14 days of high-impact US calendar. Ollama synthesizes it. Optional — skips cleanly if `GEMINI_API_KEY` isn't set. |
+| 2 | `macro_agent.py` | Gemini (Google Search grounded) gathers a live factual brief — Fed stance, DXY/yields, risk sentiment, next 14 days of high-impact US calendar — then Gemini synthesizes it. Optional — skips cleanly if `GEMINI_API_KEY` isn't set. |
 | 3 | `gold_engine.run_gold_bias()` | H4 EMA-stack + swing-structure read (BULLISH/BEARISH/NEUTRAL) + COT + USD-proxy context. Informational — surfaced on its own, doesn't gate scalp/swing. |
 | 4 | `gold_engine.run_gold_scalp()` | **Session-gated** (London 07-10 UTC / NY 12-16 UTC killzones only). Detects a liquidity sweep on M15 (stop hunt beyond a recent swing high/low that reverses) — the core entry trigger — then scores confluence: HTF structure agreement, order block/FVG overlap, COT alignment, Judas Swing context. Fires only above `GOLD_MIN_CONFIDENCE` (0.55), gated by cooldown, daily loss limit, and trade-count cap. |
 | 5 | `gold_engine.run_gold_swing()` | Same detection logic on H1/H4 for multi-day structure, not session-gated (swing doesn't need killzone timing) — still risk/cooldown/news gated. |
@@ -184,8 +184,8 @@ Actions):
 | `TELEGRAM_TOKEN` | Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | Channel/chat to post signals to |
 | `TWELVEDATA_KEY` | TwelveData market data |
-| `OLLAMA_API_KEY` | Ollama Cloud (reasoning/synthesis calls) |
-| `GEMINI_API_KEY` | Gemini live macro data gathering (step 2). Optional — pipeline skips step 2 cleanly if unset. |
+| `GEMINI_API_KEY` | Gemini — all LLM text: live macro gather + synthesis (step 2), signal reasoning, Arabic executive summary. Steps fall back to plain-text output if unset. |
+| `GEMINI_MODEL` | Optional — overrides the default `gemini-3.7-flash`. |
 
 For local runs, export the same variables in your shell (or use a local
 `.env` file — loaded automatically via `python-dotenv`).

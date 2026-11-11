@@ -16,18 +16,16 @@ reads, so this doesn't depend on a deprecated module:
           + latest fired gold_scalp/gold_swing signal in the last 24h(+-1)
 
 That combination can range roughly -5..+5; displayed clipped to -4..+4 to
-match the template. The executive-summary paragraph is LLM-written (Ollama)
+match the template. The executive-summary paragraph is LLM-written (Gemini)
 from the computed table so the narrative actually reflects the numbers,
 rather than being freeform/unfounded commentary.
 """
 
-import time
 from pathlib import Path
 
-import requests
 import pandas as pd
 
-from config import MARKETS, OLLAMA_URL, OLLAMA_MODEL, OLLAMA_KEY
+from config import MARKETS, gemini_text
 from gold_engine import structure_bias
 from data_feeds import fetch_intraday, fetch_all_cot
 from indicators import add_base
@@ -122,28 +120,12 @@ def compute_asset_scores(assets: list | None = None) -> list[dict]:
     return rows
 
 
-def _ollama_text(system: str, user: str, max_tokens: int = 500) -> str:
-    """Same Ollama Cloud endpoint the rest of the system uses, but returns raw
-    text instead of parsed JSON — free-form Arabic prose isn't safe to force
-    through a JSON round-trip."""
-    for attempt in range(2):
-        try:
-            r = requests.post(OLLAMA_URL,
-                              headers={"Authorization": f"Bearer {OLLAMA_KEY}",
-                                       "Content-Type": "application/json"},
-                              json={"model": OLLAMA_MODEL, "stream": False,
-                                    "options": {"temperature": 0.4, "num_predict": max(max_tokens, 800)},
-                                    "messages": [{"role": "system", "content": system},
-                                                 {"role": "user",   "content": user}]},
-                              timeout=120)
-            if not r.ok:
-                time.sleep(3)
-                continue
-            return r.json()["message"]["content"].strip()
-        except Exception:
-            if attempt < 1:
-                time.sleep(2)
-    return "تعذر توليد الملخص التنفيذي هذا اليوم — راجع جدول الأصول أدناه مباشرة."
+def _llm_text_ar(system: str, user: str) -> str:
+    """Free-form Arabic prose via Gemini (config.gemini_text). Returns the
+    model text, or a graceful Arabic fallback if Gemini is unavailable/empty —
+    prose isn't safe to force through a JSON round-trip."""
+    return gemini_text(system, user) or \
+        "تعذر توليد الملخص التنفيذي هذا اليوم — راجع جدول الأصول أدناه مباشرة."
 
 
 SUMMARY_SYSTEM_AR = """أنت محلل أسواق مالية. تكتب ملخصًا تنفيذيًا يوميًا موجزًا بالعربية
@@ -158,7 +140,7 @@ def generate_executive_summary(scores: list[dict]) -> str:
         f"{r['asset']}: score={r['score']:+d} bias={r['bias']} cot={r['cot_signal']}"
         for r in scores
     )
-    return _ollama_text(SUMMARY_SYSTEM_AR, f"جدول نقاط اليوم:\n{table_txt}")
+    return _llm_text_ar(SUMMARY_SYSTEM_AR, f"جدول نقاط اليوم:\n{table_txt}")
 
 
 _ACTION_AR = {

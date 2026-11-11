@@ -127,9 +127,9 @@ def run_cot_layer():
 
 
 def run_macro_layer():
-    """Step 2 — Gemini-grounded live macro gather + Ollama synthesis.
+    """Step 2 — Gemini-grounded live macro gather + Gemini synthesis.
     Optional: skips cleanly if GEMINI_API_KEY isn't set."""
-    print("\n═══ STEP 2 — MACRO AGENT (Gemini + Ollama) ═══")
+    print("\n═══ STEP 2 — MACRO AGENT (Gemini) ═══")
     from macro_agent import run_macro_agent
     result = run_macro_agent()
     if result.get("synthesis"):

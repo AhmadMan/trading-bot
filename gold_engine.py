@@ -33,11 +33,10 @@ import json
 import time
 from pathlib import Path
 
-import requests
 import pandas as pd
 
 from config import (
-    MARKETS, OLLAMA_URL, OLLAMA_MODEL, OLLAMA_KEY, ACCOUNT_SIZE, RISK_PCT,
+    MARKETS, GEMINI_API_KEY, gemini_text, ACCOUNT_SIZE, RISK_PCT,
     GOLD_SESSIONS_UTC, GOLD_JUDAS_WINDOW_MIN, GOLD_IMPULSE_ATR_MULT,
     GOLD_SWEEP_LOOKBACK, GOLD_STRUCTURE_LOOKBACK, GOLD_ATR_STOP_BUFFER,
     GOLD_TP1_RR, GOLD_TP2_RR, GOLD_TP3_RR, GOLD_MIN_CONFIDENCE, GOLD_SCALP_COOLDOWN_MIN,
@@ -327,25 +326,13 @@ to take the trade — that decision is already made."""
 
 def _llm_reasoning(direction: str, factors: list[str]) -> str:
     fallback = f"{direction} — " + "; ".join(factors)
-    if not OLLAMA_KEY:
+    if not GEMINI_API_KEY:
         return fallback
-    try:
-        r = requests.post(
-            OLLAMA_URL,
-            headers={"Authorization": f"Bearer {OLLAMA_KEY}", "Content-Type": "application/json"},
-            json={"model": OLLAMA_MODEL, "stream": False,
-                  "options": {"temperature": 0.3, "num_predict": 200},
-                  "messages": [{"role": "system", "content": _REASONING_SYSTEM},
-                               {"role": "user", "content": f"Direction: {direction}\nFactors: " + "; ".join(factors)}]},
-            timeout=45,
-        )
-        if r.ok:
-            text = r.json()["message"]["content"].strip()
-            if text:
-                return text
-    except Exception as e:
-        print(f"    ⚠ reasoning LLM call failed, using fallback text: {e}")
-    return fallback
+    text = gemini_text(
+        _REASONING_SYSTEM,
+        f"Direction: {direction}\nFactors: " + "; ".join(factors),
+    )
+    return text or fallback
 
 
 # =============================================================================
