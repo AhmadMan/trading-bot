@@ -111,19 +111,42 @@ def _send_gold_chart(interval: str, sig: dict, caption: str, layer: str = ""):
 
 def run_cot_layer():
     """Step 1 — official CFTC positioning (+ insider-week fallback). Gold
-    engine reads this as an additive confidence input, not a veto."""
-    print("\n═══ STEP 1 — COT AGENT ═══")
+    engine reads this as an additive confidence input, not a veto.
+
+    DATA ONLY — the pipeline no longer BROADCASTS the COT map to Telegram
+    (it was going out on every 30-min run). The map is now published once a
+    day at 07:00 Amsterdam by run_cot_map_layer() / the cot_map workflow.
+    This step still fetches the data so the engine has its COT input."""
+    print("\n═══ STEP 1 — COT AGENT (data) ═══")
+    from cot_agent import run_cot_agent
+    cot_map = run_cot_agent()
+    n = sum(1 for c in cot_map.values() if c)
+    print(f"  COT data loaded for {n} market(s) (map broadcast runs once/day at 07:00 Amsterdam)")
+    return cot_map
+
+
+def run_cot_map_layer():
+    """Publish the COT MAP to Telegram — ONCE per day at 07:00 Europe/Amsterdam.
+    The workflow fires at 05:00 and 06:00 UTC (covering CEST and CET); this
+    gate lets through only the run that is actually 07:xx Amsterdam, so the map
+    is sent exactly once, DST-safe. --force bypasses the gate for manual runs."""
+    import os
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    print("\n═══ COT MAP (daily broadcast) ═══")
+    if "--force" not in sys.argv:
+        hr = datetime.now(ZoneInfo("Europe/Amsterdam")).hour
+        if hr != 7:
+            print(f"  Amsterdam time is {hr:02d}:xx, not 07:xx — skipping COT map broadcast.")
+            return
     from cot_agent import run_cot_agent, build_cot_summary
     cot_map = run_cot_agent()
     cot_list = [{"market": m, **c} for m, c in cot_map.items() if c]
     if cot_list:
-        # COT only updates weekly — send on change / once a day, not every run.
-        sig = ",".join(f"{m}:{(c or {}).get('signal','')}" for m, c in sorted(cot_map.items()) if c)
-        if _should_notify("cot", sig):
-            telegram.send_text(telegram.format_cot_map(cot_list, summary=build_cot_summary(cot_map)))
-        else:
-            print("  (COT unchanged — dashboard updated, Telegram skipped)")
-    return cot_map
+        telegram.send_text(telegram.format_cot_map(cot_list, summary=build_cot_summary(cot_map)))
+        print(f"  📨 COT map sent for {len(cot_list)} market(s)")
+    else:
+        print("  no COT data available this run")
 
 
 def run_macro_layer():
@@ -349,7 +372,7 @@ def run_backtest_layer(assets=None, bars=2000, window=500):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gold-only Sequential Pipeline TradingBot")
     parser.add_argument("--layer", default=None,
-                        choices=["cot", "macro", "gold_bias", "gold_scalp", "gold_swing",
+                        choices=["cot", "cot_map", "macro", "gold_bias", "gold_scalp", "gold_swing",
                                  "extra", "performance", "news", "news_weekly", "tracer",
                                  "cot_weekly", "daily_brief", "backtest"])
     parser.add_argument("--asset",  default=None)   # kept for backtest compat; engine itself is gold-only
@@ -364,6 +387,8 @@ if __name__ == "__main__":
     try:
         if run_all:
             run_pipeline()
+        elif args.layer == "cot_map":
+            run_cot_map_layer()
         elif args.layer == "cot":
             run_cot_layer()
         elif args.layer == "macro":

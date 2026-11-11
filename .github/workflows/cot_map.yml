@@ -1,0 +1,37 @@
+name: COT Map (daily 07:00 Amsterdam)
+
+on:
+  schedule:
+    # 07:00 Europe/Amsterdam, DST-safe. GitHub cron is UTC-only, so fire at
+    # BOTH 05:00 UTC (= 07:00 CEST, summer) and 06:00 UTC (= 07:00 CET, winter);
+    # main.py's 07:xx-Amsterdam gate lets through only the matching run, so the
+    # COT map goes out exactly ONCE each weekday morning.
+    - cron: '0 5 * * 1-5'
+    - cron: '0 6 * * 1-5'
+  workflow_dispatch:   # manual run forces the send regardless of time
+
+permissions:
+  contents: write
+
+jobs:
+  cot_map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Send COT map
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_KEY:   ${{ secrets.TWELVEDATA_KEY }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python main.py --layer cot_map --force
+          else
+            python main.py --layer cot_map
+          fi
